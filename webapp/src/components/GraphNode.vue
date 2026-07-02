@@ -6,6 +6,7 @@ export const NODE_H = 74;
 <script setup lang="ts">
 import { computed } from "vue";
 import { usePipelineStore } from "../stores/pipeline";
+import { countParams, fmtParams } from "../lib/paramMath";
 import type { NodeStateSnapshot, PortSpec } from "../types";
 
 const props = defineProps<{
@@ -34,6 +35,36 @@ const descriptor = computed(() => store.catalog.find((d) => d.type === props.nod
 const accent = computed(() => CATEGORY_COLORS[descriptor.value?.category ?? "custom"]);
 const pos = computed(() => props.node.position ?? { x: 0, y: 0 });
 
+/** Labels derive from live parameter configuration — never hardcoded sizes. */
+const displayLabel = computed(() => {
+  if (descriptor.value?.category !== "train") return props.node.label;
+  const arch = store.state?.nodes.find((n) => n.type === "model.architecture");
+  if (!arch) return props.node.label;
+  const tok = store.state?.nodes.find((n) => n.type === "tokenizer.byteBpe");
+  const p = arch.params as Record<string, unknown>;
+  const total = countParams({
+    vocabSize: Number(tok?.params.vocabSize ?? 8192),
+    dModel: Number(p.dModel ?? 120),
+    contextLength: Number(p.contextLength ?? 64),
+    hiddenDim: Number(p.hiddenDim ?? 256),
+    nLayers: Number(p.nLayers ?? 1),
+    nHeads: Number(p.nHeads ?? 1),
+    kvHeads: Number(p.kvHeads ?? 1),
+    mlp: (p.mlp as "standard" | "swiglu") ?? "standard",
+    tieEmbeddings: true,
+  }).total;
+  return `${props.node.label} (${fmtParams(total)})`;
+});
+
+/** Live 0..1 progress streamed as node_progress metrics. */
+const progress = computed(() => store.nodeProgress[props.node.id] ?? null);
+/** Last high-resolution execution time (performance.now() on the engine). */
+const execTime = computed(() => {
+  const t = store.nodeTimes[props.node.id];
+  if (t == null) return null;
+  return t < 1000 ? `${t.toFixed(0)}ms` : `${(t / 1000).toFixed(1)}s`;
+});
+
 const STATUS_BADGE: Record<string, { text: string; cls: string }> = {
   idle: { text: "idle", cls: "fill-slate-500" },
   running: { text: "running…", cls: "fill-amber-400" },
@@ -41,6 +72,16 @@ const STATUS_BADGE: Record<string, { text: string; cls: string }> = {
   error: { text: "✕ error", cls: "fill-red-400" },
   skipped: { text: "skipped", cls: "fill-slate-600" },
 };
+
+const statusText = computed(() => {
+  if (props.node.status === "running" && progress.value !== null) {
+    return `running… ${(progress.value * 100).toFixed(0)}%`;
+  }
+  if (props.node.status === "done" && execTime.value) {
+    return `✓ done · ${execTime.value}`;
+  }
+  return STATUS_BADGE[props.node.status].text;
+});
 
 /** Input ports glow when they can accept the in-flight connection. */
 const acceptsPending = (p: PortSpec) =>
@@ -70,12 +111,18 @@ const acceptsPending = (p: PortSpec) =>
     <!-- category stripe -->
     <rect width="6" :height="NODE_H" rx="3" :fill="accent" />
 
-    <text x="16" y="24" class="fill-slate-100 text-[13px] font-semibold">{{ node.label }}</text>
+    <text x="16" y="24" class="fill-slate-100 text-[13px] font-semibold">{{ displayLabel }}</text>
     <text x="16" y="42" class="fill-slate-500 text-[10px] font-mono">{{ node.id }} · {{ node.type }}</text>
-    <text x="16" y="60" class="text-[11px]" :class="STATUS_BADGE[node.status].cls">
-      {{ STATUS_BADGE[node.status].text }}
+    <text x="16" y="58" class="text-[11px]" :class="STATUS_BADGE[node.status].cls">
+      {{ statusText }}
       <tspan v-if="node.error" class="fill-red-400"> — {{ node.error.slice(0, 24) }}</tspan>
     </text>
+
+    <!-- live progress bar (node_progress 0..1 streamed over WebSockets) -->
+    <g v-if="node.status === 'running' && progress !== null">
+      <rect x="16" y="64" :width="NODE_W - 32" height="4" rx="2" class="fill-slate-700" />
+      <rect x="16" y="64" :width="Math.max(2, (NODE_W - 32) * Math.min(1, progress))" height="4" rx="2" :fill="accent" />
+    </g>
 
     <!-- input ports — pointerup completes a pending connection -->
     <circle

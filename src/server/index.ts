@@ -150,6 +150,14 @@ wss.on("connection", (ws) => {
         }
         case "library_list":
           return send({ ev: "library", variants: library.list() });
+        case "library_create":
+          library.create(msg.name, msg.overrides ?? {});
+          return;
+        case "library_delete":
+          return library.delete(msg.variantId);
+        case "library_rename":
+          library.rename(msg.variantId, msg.name);
+          return;
         case "library_clone":
           library.clone(msg.sourceId, msg.name, msg.overrides ?? {});
           return;

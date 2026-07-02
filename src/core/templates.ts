@@ -24,13 +24,15 @@ function chain(
   return {
     name,
     nodes: [
+      // Grid/layer layout rule: ≥320px horizontal, ≥160px vertical padding so
+      // instantiated nodes never overlap and edge routing stays clean.
       { id: "ingest", type: "data.jsIngestion", position: { x: 40, y: 220 },
         params: { dataset: "codeparrot/github-code-clean", config: "JavaScript-mit", maxDocs: 1000 } },
-      { id: "tokenize", type: "tokenizer.byteBpe", position: { x: 300, y: 220 }, params: tokenizerParams },
-      { id: "arch", type: "model.architecture", position: { x: 560, y: 220 }, params: archParams },
-      { id: "train", type: "train.poc", position: { x: 820, y: 220 }, params: trainParams },
-      { id: "eval", type: "eval.basic", position: { x: 1080, y: 220 }, params: {} },
-      { id: "export", type: "export.binary", position: { x: 1340, y: 220 },
+      { id: "tokenize", type: "tokenizer.byteBpe", position: { x: 360, y: 220 }, params: tokenizerParams },
+      { id: "arch", type: "model.architecture", position: { x: 680, y: 220 }, params: archParams },
+      { id: "train", type: "train.poc", position: { x: 1000, y: 220 }, params: trainParams },
+      { id: "eval", type: "eval.basic", position: { x: 1320, y: 220 }, params: {} },
+      { id: "export", type: "export.binary", position: { x: 1640, y: 220 },
         params: { outFile: `exports/${name}` } },
     ],
     edges: [

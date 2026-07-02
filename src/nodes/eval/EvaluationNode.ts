@@ -71,6 +71,7 @@ export class EvaluationNode implements PipelineNode {
         return data.subarray(start, start + windowLen);
       });
       total += model.evalLoss(batch);
+      ctx.metric("node_progress", (b + 1) / p.evalBatches);
     }
     const loss = total / p.evalBatches;
     const perplexity = Math.exp(loss);

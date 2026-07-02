@@ -20,7 +20,7 @@ import type {
 
 const DESCRIPTOR: NodeDescriptor = {
   type: "train.poc",
-  label: "PoC Trainer (1M params)",
+  label: "Trainer",
   category: "train",
   theory:
     "Minimal-but-real training loop: sample random context windows, forward " +
@@ -38,7 +38,7 @@ const DESCRIPTOR: NodeDescriptor = {
     { key: "steps", label: "Training steps", type: "number", default: 30,
       theory: "Each step = one gradient update on batchSize windows. Loss " +
         "should fall from ln(V) (uniform prediction) within tens of steps.",
-      range: "10–100 PoC · thousands for real runs" },
+      range: "10–100 quick runs · thousands for real training" },
     { key: "batchSize", label: "Batch size", type: "number", default: 4,
       theory: "Windows averaged per update. Larger batch ⇒ lower gradient " +
         "variance ⇒ supports higher lr (linear-scaling heuristic), but memory " +
@@ -80,7 +80,7 @@ export class PoCTrainer implements PipelineNode {
   async run(inputs: Record<string, unknown>, ctx: NodeRunContext) {
     const config = inputs.config as ModelConfig;
     const tokenRef = inputs.tokens as TokenFileRef;
-    if (!config || !tokenRef) throw new Error("PoCTrainer requires 'config' and 'tokens'");
+    if (!config || !tokenRef) throw new Error("Trainer requires 'config' and 'tokens'");
     const p = this.params as { steps: number; batchSize: number; lr: number; logEvery: number };
 
     // Load the shard as raw uint16 — a 2M-token shard is only 4MB of RAM.
@@ -125,6 +125,7 @@ export class PoCTrainer implements PipelineNode {
           ctx.metric("tokens_per_sec", tps, { step });
           ctx.metric("vram_mb", vram, { step });
           ctx.metric("rss_mb", rssMb, { step });
+          ctx.metric("node_progress", step / p.steps, { step });
           ctx.log(
             `step ${step}/${p.steps}  loss=${loss.toFixed(4)}  ` +
             `${tps.toFixed(0)} tok/s  vram=${vram}MB  rss=${rssMb.toFixed(0)}MB`

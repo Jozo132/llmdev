@@ -20,7 +20,7 @@ const DESCRIPTOR: NodeDescriptor = {
     "page-by-page from the Hugging Face rows API — backpressure-driven, so " +
     "nothing raw ever touches disk (100GB budget). Dataset scale intuition: " +
     "Chinchilla-optimal training wants ≈20 tokens per parameter, so a 10M " +
-    "model wants ~200M tokens; PoC runs use far less and simply undertrain.",
+    "model wants ~200M tokens; smaller runs simply undertrain.",
   inputs: [],
   outputs: [{ name: "text", dataType: "text-stream" }],
   paramSchema: [
@@ -32,7 +32,7 @@ const DESCRIPTOR: NodeDescriptor = {
     { key: "maxDocs", label: "Max documents", type: "number", default: 500,
       theory: "Hard cap on streamed documents — the disk/compute budget knob. " +
         "More docs ⇒ more unique tokens ⇒ less memorization per epoch.",
-      range: "100–10000 for PoC scale" },
+      range: "100–10000 at experimental scale" },
     { key: "maxDocChars", label: "Max chars/doc", type: "number", default: 20000,
       theory: "Truncates pathological files; keeps the token distribution from " +
         "being dominated by single giant bundles.",
@@ -63,9 +63,14 @@ export class JsIngestionNode implements PipelineNode {
     ctx.log(`Streaming ${p.dataset} [${p.config}/${p.split}] — no raw data hits disk.`);
 
     // Lazy async generator: HTTP pages are fetched only as the downstream
-    // tokenizer pulls documents, so backpressure is free.
+    // tokenizer pulls documents, so backpressure is free. The sourceKey
+    // identifies the dataset slice for the downstream BPE cache layer.
     const stream = this.streamDocs(p, ctx);
-    return { text: stream };
+    const sourceKey = JSON.stringify({
+      dataset: p.dataset, config: p.config, split: p.split,
+      contentField: p.contentField, maxDocs: p.maxDocs, maxDocChars: p.maxDocChars,
+    });
+    return { text: Object.assign(stream, { sourceKey }) };
   }
 
   private async *streamDocs(

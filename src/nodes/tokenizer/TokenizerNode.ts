@@ -4,10 +4,12 @@
  * a compact binary shard (.bin of uint16), flushing incrementally so memory
  * and disk stay tiny.  2 bytes/token ⇒ 10M tokens ≈ 20MB.
  */
-import { createWriteStream, statSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { createWriteStream, existsSync, statSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ByteBpeTokenizer } from "../../ml/tokenizer.js";
+import { trainBpeMerges } from "../../ml/bpeParallel.js";
 import type {
   NodeDescriptor, NodeParams, NodeRunContext, PipelineNode, TokenFileRef,
 } from "../../core/types.js";
@@ -42,7 +44,13 @@ const DESCRIPTOR: NodeDescriptor = {
       theory: "Disk-budget guardrail: tokens × 2 bytes on disk. Also bounds an " +
         "epoch: steps × batch × ctx tokens sampled per run.",
       range: "≤ 50M under the 100GB plan" },
-    { key: "outFile", label: "Output shard", type: "string", default: "tokens/js-poc.bin" },
+    { key: "threads", label: "BPE worker threads", type: "number", default: 0,
+      description: "0 = all available CPU cores",
+      theory: "Pair-frequency counting and merge application are split into " +
+        "equal chunks across a worker_threads pool; deltas stream back per " +
+        "merge, so scaling is near-linear in cores.",
+      range: "0–CPU count" },
+    { key: "outFile", label: "Output shard", type: "string", default: "tokens/shard.bin" },
   ],
 };
 
@@ -61,27 +69,74 @@ export class TokenizerNode implements PipelineNode {
     const text = inputs.text as AsyncIterable<string>;
     if (!text) throw new Error("TokenizerNode requires a 'text' input stream");
     const p = this.params as {
-      vocabSize: number; trainSampleChars: number; maxTokens: number; outFile: string;
+      vocabSize: number; trainSampleChars: number; maxTokens: number;
+      threads: number; outFile: string;
     };
+
+    const outPath = path.join(ctx.artifactsDir, p.outFile);
+    const tokPath = outPath.replace(/\.bin$/, ".tokenizer.json");
+    const cachePath = outPath.replace(/\.bin$/, ".cache.json");
+
+    // ── Cache layer: hash the dataset identity + tokenization params. ──────
+    // Upstream ingestion nodes attach a `sourceKey` to the text stream.
+    const sourceKey = (text as { sourceKey?: string }).sourceKey ?? "unkeyed";
+    const cacheKey = createHash("sha256").update(JSON.stringify({
+      sourceKey, vocabSize: p.vocabSize,
+      trainSampleChars: p.trainSampleChars, maxTokens: p.maxTokens,
+    })).digest("hex");
+
+    try {
+      if (existsSync(cachePath) && existsSync(outPath) && existsSync(tokPath)) {
+        const manifest = JSON.parse(await readFile(cachePath, "utf8")) as
+          { key: string; tokens: number };
+        if (manifest.key === cacheKey) {
+          const cached = ByteBpeTokenizer.fromJSON(JSON.parse(await readFile(tokPath, "utf8")));
+          ctx.metric("tokens_written", manifest.tokens);
+          ctx.metric("node_progress", 1);
+          ctx.log(`BPE cache hit (${cacheKey.slice(0, 12)}…) — reusing ` +
+                  `${manifest.tokens} tokens from ${outPath}, skipping training`);
+          const ref: TokenFileRef = {
+            path: outPath, tokens: manifest.tokens, vocabSize: cached.vocabSize,
+          };
+          return { tokens: ref, tokenizer: cached };
+        }
+      }
+    } catch { /* corrupt cache manifest → retrain */ }
 
     // Phase 1 — buffer a bounded sample and the docs it came from (RAM only).
     ctx.log(`Collecting ≤${p.trainSampleChars} chars to train BPE (vocab ${p.vocabSize})…`);
+    ctx.metric("node_progress", 0.02);
     const bufferedDocs: string[] = [];
     let sample = "";
     const iterator = text[Symbol.asyncIterator]();
     while (sample.length < p.trainSampleChars) {
+      if (ctx.signal.aborted) throw new Error("Cancelled while sampling");
       const { value, done } = await iterator.next();
       if (done) break;
       bufferedDocs.push(value);
       sample += value.slice(0, Math.max(0, p.trainSampleChars - sample.length));
     }
-    const tokenizer = new ByteBpeTokenizer();
+
+    // Multi-threaded merge training with live merge-count streaming.
     const t0 = performance.now();
-    tokenizer.train(sample, p.vocabSize);
-    ctx.log(`BPE trained: vocab=${tokenizer.vocabSize} in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    let lastEmit = 0;
+    const merges = await trainBpeMerges(sample, p.vocabSize, {
+      threads: p.threads > 0 ? p.threads : undefined,
+      signal: ctx.signal,
+      onMerge: (done, total) => {
+        const now = performance.now();
+        if (now - lastEmit > 100 || done === total) {
+          lastEmit = now;
+          ctx.metric("bpe_merges", done, { total });
+          ctx.metric("node_progress", 0.05 + 0.55 * (done / total));
+        }
+      },
+    });
+    if (ctx.signal.aborted) throw new Error("Cancelled during BPE training — workers terminated");
+    const tokenizer = ByteBpeTokenizer.fromJSON({ merges });
+    ctx.log(`BPE trained: vocab=${tokenizer.vocabSize} in ${((performance.now() - t0) / 1000).toFixed(1)}s (parallel pair counting)`);
 
     // Phase 2 — encode buffered docs + remaining stream straight to .bin.
-    const outPath = path.join(ctx.artifactsDir, p.outFile);
     const ws = createWriteStream(outPath);
     let written = 0;
 
@@ -93,7 +148,12 @@ export class TokenizerNode implements PipelineNode {
       const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.length * 2);
       if (!ws.write(buf)) await new Promise<void>((r) => ws.once("drain", () => r()));
       written += slice.length;
-      ctx.metric("tokens_written", written);
+      const now = performance.now();
+      if (now - lastEmit > 100) {
+        lastEmit = now;
+        ctx.metric("tokens_written", written);
+        ctx.metric("node_progress", 0.6 + 0.4 * Math.min(1, written / p.maxTokens));
+      }
       return written < p.maxTokens;
     };
 
@@ -119,8 +179,19 @@ export class TokenizerNode implements PipelineNode {
     await new Promise<void>((resolve, reject) => ws.end((err?: Error) => (err ? reject(err) : resolve())));
 
     // Persist tokenizer next to the shard for later decode/export.
-    await writeFile(outPath.replace(/\.bin$/, ".tokenizer.json"), JSON.stringify(tokenizer.toJSON()));
+    await writeFile(tokPath, JSON.stringify(tokenizer.toJSON()));
 
+    // Write the cache manifest ONLY on a complete run — a tiny .json, so the
+    // shard itself doubles as the cache (no duplicated bytes on disk).
+    if (!ctx.signal.aborted) {
+      await writeFile(cachePath, JSON.stringify({
+        key: cacheKey, tokens: written, vocabSize: tokenizer.vocabSize,
+        createdAt: new Date().toISOString(),
+      }));
+    }
+
+    ctx.metric("tokens_written", written);
+    ctx.metric("node_progress", 1);
     const bytes = statSync(outPath).size;
     ctx.log(`Shard: ${outPath} — ${written} tokens, ${(bytes / 1024 / 1024).toFixed(2)}MB on disk`);
 

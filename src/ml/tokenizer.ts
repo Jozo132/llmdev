@@ -13,7 +13,8 @@ const dec = new TextDecoder();
 export class ByteBpeTokenizer implements TokenizerHandle {
   /** merges[i] = [left, right] producing token id 256 + i */
   private merges: Array<[number, number]> = [];
-  private mergeRank = new Map<string, number>();
+  /** pair key (a*65536+b) → merge rank — numeric keys avoid string churn. */
+  private mergeRank = new Map<number, number>();
 
   get vocabSize(): number {
     return 256 + this.merges.length;
@@ -28,12 +29,12 @@ export class ByteBpeTokenizer implements TokenizerHandle {
 
     while (256 + this.merges.length < targetVocab) {
       // Count adjacent pairs.
-      const counts = new Map<string, number>();
+      const counts = new Map<number, number>();
       for (let i = 0; i < ids.length - 1; i++) {
-        const k = `${ids[i]},${ids[i + 1]}`;
+        const k = ids[i] * 65536 + ids[i + 1];
         counts.set(k, (counts.get(k) ?? 0) + 1);
       }
-      let bestKey = "";
+      let bestKey = -1;
       let bestCount = 1; // require count ≥ 2 to be worth a merge
       for (const [k, c] of counts) {
         if (c > bestCount) {
@@ -41,9 +42,10 @@ export class ByteBpeTokenizer implements TokenizerHandle {
           bestKey = k;
         }
       }
-      if (!bestKey) break;
+      if (bestKey < 0) break;
 
-      const [a, b] = bestKey.split(",").map(Number);
+      const a = Math.floor(bestKey / 65536);
+      const b = bestKey % 65536;
       const newId = 256 + this.merges.length;
       this.mergeRank.set(bestKey, this.merges.length);
       this.merges.push([a, b]);
@@ -64,19 +66,29 @@ export class ByteBpeTokenizer implements TokenizerHandle {
 
   encode(text: string): Uint16Array {
     let ids: number[] = Array.from(enc.encode(text));
-    // Repeatedly apply the lowest-rank applicable merge (standard BPE encode).
+    // Standard BPE encode: repeatedly apply the lowest-rank applicable merge.
+    // All occurrences of that rank are rewritten in ONE left-to-right pass
+    // (no lower rank can appear from a merge — its id didn't exist yet),
+    // so the scan count is bounded by distinct ranks, not merge sites.
     while (ids.length >= 2) {
       let bestRank = Infinity;
-      let bestPos = -1;
       for (let i = 0; i < ids.length - 1; i++) {
-        const r = this.mergeRank.get(`${ids[i]},${ids[i + 1]}`);
-        if (r !== undefined && r < bestRank) {
-          bestRank = r;
-          bestPos = i;
+        const r = this.mergeRank.get(ids[i] * 65536 + ids[i + 1]);
+        if (r !== undefined && r < bestRank) bestRank = r;
+      }
+      if (bestRank === Infinity) break;
+      const [a, b] = this.merges[bestRank];
+      const newId = 256 + bestRank;
+      const out: number[] = [];
+      for (let i = 0; i < ids.length; i++) {
+        if (i < ids.length - 1 && ids[i] === a && ids[i + 1] === b) {
+          out.push(newId);
+          i++;
+        } else {
+          out.push(ids[i]);
         }
       }
-      if (bestPos < 0) break;
-      ids.splice(bestPos, 2, 256 + bestRank);
+      ids = out;
     }
     return Uint16Array.from(ids);
   }
@@ -103,7 +115,7 @@ export class ByteBpeTokenizer implements TokenizerHandle {
   static fromJSON(json: { merges: Array<[number, number]> }): ByteBpeTokenizer {
     const t = new ByteBpeTokenizer();
     t.merges = json.merges;
-    json.merges.forEach(([a, b], i) => t.mergeRank.set(`${a},${b}`, i));
+    json.merges.forEach(([a, b], i) => t.mergeRank.set(a * 65536 + b, i));
     return t;
   }
 }

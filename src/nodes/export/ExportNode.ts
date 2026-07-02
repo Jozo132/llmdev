@@ -1,6 +1,6 @@
 /**
  * ExportNode — serializes the trained model to a compact binary checkpoint:
- * a small JSON header + raw little-endian fp32 weights. ~4MB for 1M params,
+ * a small JSON header + raw little-endian fp32 weights (4 bytes/param),
  * trivially loadable from JS (Float32Array) or Python (np.fromfile).
  */
 import { writeFile } from "node:fs/promises";
@@ -31,7 +31,7 @@ const DESCRIPTOR: NodeDescriptor = {
   ],
   outputs: [{ name: "artifact", dataType: "artifact" }],
   paramSchema: [
-    { key: "outFile", label: "Output file", type: "string", default: "exports/tinylm-poc" },
+    { key: "outFile", label: "Output file", type: "string", default: "exports/checkpoint" },
     { key: "formats", label: "Formats", type: "string", default: "bin,gguf,safetensors",
       description: "Comma-separated: bin | gguf | safetensors",
       theory: "bin = raw fp32 dump (fastest reload in llmdev). gguf = external " +

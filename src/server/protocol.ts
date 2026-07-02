@@ -30,6 +30,9 @@ export type ClientMessage =
   | { op: "apply_template"; templateId: string }
   // ── model library ──
   | { op: "library_list" }
+  | { op: "library_create"; name: string; overrides?: Record<string, unknown> }
+  | { op: "library_delete"; variantId: string }
+  | { op: "library_rename"; variantId: string; name: string }
   | { op: "library_clone"; sourceId: string; name: string; overrides?: Record<string, unknown> }
   | { op: "library_train"; variantId: string; steps?: number; batchSize?: number; lr?: number }
   | { op: "library_stop_train"; variantId: string }

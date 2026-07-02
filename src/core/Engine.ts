@@ -255,23 +255,28 @@ export class Engine extends EventEmitter {
 
         rt.status = "running";
         this.emitState();
+        const emitMetric = (name: string, value: number, extra?: Record<string, unknown>): void => {
+          const ev: MetricEvent = { ts: Date.now(), nodeId: id, name, value, extra };
+          this.emit("metric", ev);
+        };
+        const t0 = performance.now(); // high-resolution per-node profiling
+        emitMetric("node_progress", 0);
         try {
           rt.outputs = await rt.node.run(inputs, {
             artifactsDir: this.artifactsDir,
             signal,
             waitIfPaused: this.waitIfPaused,
-            metric: (name, value, extra) => {
-              const ev: MetricEvent = { ts: Date.now(), nodeId: id, name, value, extra };
-              this.emit("metric", ev);
-            },
+            metric: emitMetric,
             log: (message) => this.emit("log", { nodeId: id, message }),
           });
           rt.status = signal.aborted ? "skipped" : "done";
+          if (rt.status === "done") emitMetric("node_progress", 1);
         } catch (err) {
           rt.status = "error";
           rt.error = err instanceof Error ? err.message : String(err);
           this.emit("log", { nodeId: id, message: `ERROR: ${rt.error}` });
         }
+        emitMetric("execution_time_ms", performance.now() - t0);
         this.emitState();
       }
     } finally {

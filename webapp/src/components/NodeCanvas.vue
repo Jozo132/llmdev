@@ -6,7 +6,7 @@
  * apply architectural templates, and watch the live parameter-count badge
  * recompute as hyperparameters change.
  */
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { usePipelineStore } from "../stores/pipeline";
 import { countParams, fmtParams } from "../lib/paramMath";
 import GraphNode, { NODE_W, NODE_H } from "./GraphNode.vue";
@@ -18,6 +18,68 @@ const svgEl = ref<SVGSVGElement | null>(null);
 const viewBox = ref({ x: 0, y: 0, w: 1600, h: 900 });
 
 const portY = (i: number, count: number) => NODE_H / 2 + (i - (count - 1) / 2) * 14;
+
+// ── Grid/layer layout rule ───────────────────────────────────────────
+// Safe padding margins: dX ≥ 300px, dY ≥ 150px between node origins.
+const CELL_X = 320;
+const CELL_Y = 160;
+
+/** Snap to the layout grid and probe outward for the nearest free cell. */
+function findFreeSlot(x: number, y: number): { x: number; y: number } {
+  const occupied = new Set(
+    (store.state?.nodes ?? []).map((n) => {
+      const p = n.position ?? { x: 0, y: 0 };
+      return `${Math.round(p.x / CELL_X)}:${Math.round(p.y / CELL_Y)}`;
+    })
+  );
+  const cx = Math.round(x / CELL_X);
+  const cy = Math.round(y / CELL_Y);
+  for (let d = 0; d < 20; d++) {
+    for (let dy = -d; dy <= d; dy++) {
+      for (const dx of new Set([d - Math.abs(dy), -(d - Math.abs(dy))])) {
+        if (!occupied.has(`${cx + dx}:${cy + dy}`)) {
+          return { x: (cx + dx) * CELL_X, y: (cy + dy) * CELL_Y };
+        }
+      }
+    }
+  }
+  return { x: cx * CELL_X, y: cy * CELL_Y };
+}
+
+/** Longest-path layering: column per topological layer, row per sibling. */
+function autoLayout() {
+  const st = store.state;
+  if (!st?.nodes.length) return;
+  const layer = new Map<string, number>(st.nodes.map((n) => [n.id, 0]));
+  for (let pass = 0; pass < st.nodes.length; pass++) {
+    for (const e of st.edges) {
+      const l = (layer.get(e.from.node) ?? 0) + 1;
+      if (l > (layer.get(e.to.node) ?? 0)) layer.set(e.to.node, l);
+    }
+  }
+  const rows = new Map<number, number>();
+  for (const n of st.nodes) {
+    const l = layer.get(n.id) ?? 0;
+    const row = rows.get(l) ?? 0;
+    rows.set(l, row + 1);
+    store.moveNode(n.id, { x: 60 + l * CELL_X, y: 120 + row * CELL_Y });
+  }
+}
+
+// Auto-position instantiated template nodes once the new state lands.
+const pendingLayout = ref(false);
+function applyTemplate(templateId: string) {
+  store.applyTemplate(templateId);
+  pendingLayout.value = true;
+}
+watch(
+  () => store.state?.name,
+  () => {
+    if (!pendingLayout.value) return;
+    pendingLayout.value = false;
+    void nextTick(autoLayout);
+  }
+);
 
 // ── Live parameter calculator badge ──────────────────────────────────────────
 const showBreakdown = ref(false);
@@ -59,18 +121,88 @@ const bezier = (x1: number, y1: number, x2: number, y2: number) => {
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
 };
 
+// ── Box-avoiding edge routing ────────────────────────────────────────
+type Pt = { x: number; y: number };
+type Seg = [Pt, Pt, Pt, Pt];
+const OBSTACLE_PAD = 16;
+
+const cubicAt = (s: Seg, t: number): Pt => {
+  const u = 1 - t;
+  const a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+  return {
+    x: a * s[0].x + b * s[1].x + c * s[2].x + d * s[3].x,
+    y: a * s[0].y + b * s[1].y + c * s[2].y + d * s[3].y,
+  };
+};
+
+function obstacleBoxes(excludeIds: string[]) {
+  return (store.state?.nodes ?? [])
+    .filter((n) => !excludeIds.includes(n.id))
+    .map((n) => {
+      const p = n.position ?? { x: 0, y: 0 };
+      return {
+        x0: p.x - OBSTACLE_PAD, y0: p.y - OBSTACLE_PAD,
+        x1: p.x + NODE_W + OBSTACLE_PAD, y1: p.y + NODE_H + OBSTACLE_PAD,
+      };
+    });
+}
+
+function pathClear(segs: Seg[], boxes: ReturnType<typeof obstacleBoxes>): boolean {
+  for (const seg of segs) {
+    for (let i = 1; i < 16; i++) {
+      const pt = cubicAt(seg, i / 16);
+      if (boxes.some((o) => pt.x > o.x0 && pt.x < o.x1 && pt.y > o.y0 && pt.y < o.y1)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+const segsToPath = (segs: Seg[]): string =>
+  `M ${segs[0][0].x} ${segs[0][0].y}` +
+  segs.map((s) => ` C ${s[1].x} ${s[1].y}, ${s[2].x} ${s[2].y}, ${s[3].x} ${s[3].y}`).join("");
+
+/**
+ * Route a connector from output port `a` to input port `b`, offsetting the
+ * Bezier via a mid waypoint whenever the direct curve would cut across a
+ * neighbouring node's bounding box. `lane` fans out siblings from one port.
+ */
+function routeEdge(a: Pt, b: Pt, excludeIds: string[], lane = 0): string {
+  const boxes = obstacleBoxes(excludeIds);
+  const dx = Math.max(60, Math.abs(b.x - a.x) / 2) + lane * 14;
+  const direct: Seg[] = [[a, { x: a.x + dx, y: a.y }, { x: b.x - dx, y: b.y }, b]];
+  if (pathClear(direct, boxes)) return segsToPath(direct);
+
+  const mx = (a.x + b.x) / 2;
+  const half = Math.max(48, dx / 2);
+  for (const off of [90, -90, 170, -170, 250, -250, 330, -330]) {
+    const m: Pt = { x: mx, y: (a.y + b.y) / 2 + off };
+    const segs: Seg[] = [
+      [a, { x: a.x + half, y: a.y }, { x: m.x - half, y: m.y }, m],
+      [m, { x: m.x + half, y: m.y }, { x: b.x - half, y: b.y }, b],
+    ];
+    if (pathClear(segs, boxes)) return segsToPath(segs);
+  }
+  return segsToPath(direct); // no clean detour — fall back to the direct curve
+}
+
 const edgePaths = computed(() => {
   const st = store.state;
   if (!st) return [];
+  const laneOf = new Map<string, number>();
   return st.edges.map((e, i) => {
     const a = portPos(e.from.node, e.from.port, true);
     const b = portPos(e.to.node, e.to.port, false);
+    const laneKey = `${e.from.node}:${e.from.port}`;
+    const lane = laneOf.get(laneKey) ?? 0;
+    laneOf.set(laneKey, lane + 1);
     const f = st.nodes.find((n) => n.id === e.from.node);
     const t = st.nodes.find((n) => n.id === e.to.node);
     return {
       key: `${i}`,
       edge: e,
-      d: bezier(a.x, a.y, b.x, b.y),
+      d: routeEdge(a, b, [e.from.node, e.to.node], lane),
       active: st.running && f?.status === "done" && t?.status === "running",
       selected:
         selectedEdge.value !== null &&
@@ -134,9 +266,10 @@ function onPaletteDrop(e: PointerEvent) {
     const p = svgPoint(e);
     const type = paletteDrag.value.type;
     const id = `${type.split(".").pop()}-${Math.random().toString(36).slice(2, 6)}`;
+    // Auto-position on the layout grid — never overlapping an existing node.
     store.addNode({
       id, type, params: {},
-      position: { x: Math.round(p.x - NODE_W / 2), y: Math.round(p.y - NODE_H / 2) },
+      position: findFreeSlot(p.x - NODE_W / 2, p.y - NODE_H / 2),
     });
   }
   paletteDrag.value = null;
@@ -238,12 +371,17 @@ const CATEGORY_COLORS: Record<string, string> = {
         <button
           class="w-full rounded border border-slate-800 px-2 py-1 text-left text-[11px] hover:border-amber-600 hover:bg-slate-800"
           :title="t.description"
-          @click="store.applyTemplate(t.id)"
+          @click="applyTemplate(t.id)"
         >
           <span class="font-semibold text-slate-200">{{ t.name }}</span>
           <span class="ml-1 font-mono text-[9px] text-amber-400">{{ fmtParams(t.designParams) }}</span>
         </button>
       </div>
+      <button
+        class="mt-1 w-full rounded border border-slate-800 px-2 py-1 text-[10px] text-slate-400 hover:border-sky-700 hover:bg-slate-800"
+        title="Re-flow nodes onto the layered grid (≥320×160 spacing)"
+        @click="autoLayout"
+      >⊞ Auto layout</button>
 
       <p class="mb-1 mt-3 text-[10px] font-bold uppercase tracking-widest text-slate-500">
         Node palette <span class="normal-case text-slate-600">(drag onto canvas)</span>

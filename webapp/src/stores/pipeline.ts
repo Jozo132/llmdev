@@ -27,12 +27,16 @@ export const usePipelineStore = defineStore("pipeline", {
     catalog: [] as NodeDescriptor[],
     templates: [] as ArchTemplate[],
     metrics: {} as Record<string, MetricEvent[]>, // keyed by metric name
+    nodeProgress: {} as Record<string, number>,   // nodeId → 0..1 live progress
+    nodeTimes: {} as Record<string, number>,      // nodeId → execution_time_ms
     logs: [] as Array<{ nodeId: string; message: string }>,
     selectedNodeId: null as string | null,
     lastError: "" as string,
     // ── model library ──
     library: [] as ModelVariant[],
     variantMetrics: {} as Record<string, VariantMetric[]>, // live sparklines
+    /** Variant the user tried to open while a heavy process holds memory. */
+    pendingOpenId: null as string | null,
     // ── chat sandbox ──
     chatMessages: [] as ChatMessage[],
     activeChatId: null as string | null,
@@ -53,6 +57,12 @@ export const usePipelineStore = defineStore("pipeline", {
     latestMetric: (s) => (name: string): MetricEvent | null => {
       const arr = s.metrics[name];
       return arr?.length ? arr[arr.length - 1] : null;
+    },
+    /** Non-null while an active process owns the memory context. */
+    busyReason(s): string | null {
+      if (s.state?.running) return "a pipeline is executing (BPE tokenization / training)";
+      if (s.library.some((v) => v.training)) return "a model variant is training";
+      return null;
     },
   },
 
@@ -82,6 +92,14 @@ export const usePipelineStore = defineStore("pipeline", {
           this.templates = msg.templates;
           break;
         case "metric": {
+          if (msg.metric.name === "node_progress") {
+            this.nodeProgress[msg.metric.nodeId] = msg.metric.value;
+            break;
+          }
+          if (msg.metric.name === "execution_time_ms") {
+            this.nodeTimes[msg.metric.nodeId] = msg.metric.value;
+            break;
+          }
           const arr = (this.metrics[msg.metric.name] ??= []);
           arr.push(msg.metric);
           if (arr.length > METRIC_HISTORY) arr.shift();
@@ -140,6 +158,8 @@ export const usePipelineStore = defineStore("pipeline", {
 
     run() {
       this.metrics = {};
+      this.nodeProgress = {};
+      this.nodeTimes = {};
       this.send({ op: "run" });
     },
     stop() {
@@ -192,6 +212,42 @@ export const usePipelineStore = defineStore("pipeline", {
     // ── model library ──
     cloneVariant(sourceId: string, name: string, overrides: Record<string, unknown> = {}) {
       this.send({ op: "library_clone", sourceId, name, overrides });
+    },
+    createVariant(name: string, overrides: Record<string, unknown> = {}) {
+      this.send({ op: "library_create", name, overrides });
+    },
+    deleteVariant(variantId: string) {
+      if (this.chatVariantId === variantId) this.chatVariantId = null;
+      this.send({ op: "library_delete", variantId });
+    },
+    renameVariant(variantId: string, name: string) {
+      this.send({ op: "library_rename", variantId, name });
+    },
+    /**
+     * Active-process blocker: opening another model while BPE tokenization or
+     * training runs is intercepted — the UI must get an explicit force-cancel
+     * confirmation before the active memory context is destroyed.
+     */
+    openVariant(variantId: string) {
+      if (variantId === this.chatVariantId) return;
+      if (this.busyReason) {
+        this.pendingOpenId = variantId;
+        return;
+      }
+      this.chatVariantId = variantId;
+    },
+    confirmForceOpen() {
+      // Destroy the active context: abort the pipeline (frees worker threads /
+      // GPU buffers) and stop every training variant.
+      this.send({ op: "stop" });
+      for (const v of this.library) {
+        if (v.training) this.send({ op: "library_stop_train", variantId: v.id });
+      }
+      if (this.pendingOpenId) this.chatVariantId = this.pendingOpenId;
+      this.pendingOpenId = null;
+    },
+    cancelPendingOpen() {
+      this.pendingOpenId = null;
     },
     trainVariant(variantId: string, steps = 30) {
       this.variantMetrics[variantId] = [];

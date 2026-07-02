@@ -17,7 +17,7 @@
 import { EventEmitter } from "node:events";
 import {
   copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync,
-  symlinkSync, unlinkSync, writeFileSync, lstatSync,
+  rmSync, symlinkSync, unlinkSync, writeFileSync, lstatSync, readlinkSync,
 } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -56,6 +56,12 @@ export interface VariantMetric {
 const paramCountOf = (c: ModelConfig): number =>
   c.vocabSize * c.dModel + c.contextLength * c.dModel +
   c.dModel * c.hiddenDim + c.hiddenDim + c.hiddenDim * c.dModel + c.dModel;
+
+const slugify = (name: string): string =>
+  name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+/** Every file an exported checkpoint may own on disk. */
+const EXPORT_EXTS = [".json", ".weights.bin", ".tokenizer.json", ".gguf", ".safetensors"];
 
 export class LibraryManager extends EventEmitter {
   private readonly exportsDir: string;
@@ -131,13 +137,129 @@ export class LibraryManager extends EventEmitter {
     throw new Error("No token shard found — run the ingestion pipeline first");
   }
 
+  // ── Create / Delete / Rename ─────────────────────────────────────────
+
+  /** Create a blank variant from config — weights are random-init at first train. */
+  create(name: string, overrides: Partial<ModelConfig> = {}): ModelVariant {
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("Model name is required");
+    const config: ModelConfig = {
+      vocabSize: 8192, dModel: 120, contextLength: 64, hiddenDim: 256,
+      mixer: "causal-mean", loss: "cross-entropy", ...overrides,
+    };
+    const id = `${slugify(trimmed) || "model"}-${Date.now().toString(36).slice(-4)}`;
+    const dir = path.join(this.libraryDir, id);
+    mkdirSync(dir, { recursive: true });
+    const variant: ModelVariant = {
+      id,
+      name: trimmed,
+      source: "clone",
+      config,
+      paramCount: paramCountOf(config),
+      weightsPath: path.join(dir, "weights.bin"),
+      tokenizerPath: this.fallbackTokenizer(),
+      createdAt: new Date().toISOString(),
+      history: [],
+      training: false,
+    };
+    writeFileSync(path.join(dir, "model.json"), JSON.stringify(variant, null, 2));
+    this.emit("library", this.list());
+    return variant;
+  }
+
+  /** Delete a variant AND its bytes on disk; materializes dependent symlinks first. */
+  delete(id: string): void {
+    if (this.trainingIds.has(id)) {
+      throw new Error(`"${id}" is training — stop it before deleting`);
+    }
+    const all = this.list();
+    const variant = all.find((v) => v.id === id);
+    if (!variant) throw new Error(`Unknown variant: ${id}`);
+
+    // Children may symlink this variant's weights (zero-copy clones) — copy
+    // real bytes into them before the parent disappears.
+    for (const child of all) {
+      if (child.parentId !== id) continue;
+      try {
+        if (existsSync(child.weightsPath) && lstatSync(child.weightsPath).isSymbolicLink() &&
+            existsSync(variant.weightsPath)) {
+          unlinkSync(child.weightsPath);
+          copyFileSync(variant.weightsPath, child.weightsPath);
+        }
+      } catch { /* best-effort materialization */ }
+    }
+
+    if (variant.source === "clone") {
+      rmSync(path.join(this.libraryDir, id), { recursive: true, force: true });
+    } else {
+      const base = path.join(this.exportsDir, variant.name);
+      for (const ext of EXPORT_EXTS) {
+        if (existsSync(base + ext)) unlinkSync(base + ext);
+      }
+    }
+    this.emit("library", this.list());
+  }
+
+  /** Rename a variant; export renames move every checkpoint file atomically. */
+  rename(id: string, newName: string): string {
+    if (this.trainingIds.has(id)) {
+      throw new Error(`"${id}" is training — stop it before renaming`);
+    }
+    const name = newName.trim();
+    if (!name) throw new Error("Model name is required");
+    const variant = this.list().find((v) => v.id === id);
+    if (!variant) throw new Error(`Unknown variant: ${id}`);
+
+    let newId = id;
+    if (variant.source === "clone") {
+      const metaPath = path.join(this.libraryDir, id, "model.json");
+      const meta = JSON.parse(readFileSync(metaPath, "utf8")) as ModelVariant;
+      meta.name = name;
+      writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    } else {
+      const slug = slugify(name) || "model";
+      const oldBase = path.join(this.exportsDir, variant.name);
+      const newBase = path.join(this.exportsDir, slug);
+      if (slug !== variant.name && existsSync(`${newBase}.json`)) {
+        throw new Error(`An export named "${slug}" already exists`);
+      }
+      for (const ext of EXPORT_EXTS) {
+        if (existsSync(oldBase + ext)) renameSync(oldBase + ext, newBase + ext);
+      }
+      newId = `export:${slug}`;
+      // Re-point clones: parentId, tokenizerPath, and weight symlinks.
+      for (const dir of readdirSync(this.libraryDir)) {
+        const metaPath = path.join(this.libraryDir, dir, "model.json");
+        if (!existsSync(metaPath)) continue;
+        try {
+          const meta = JSON.parse(readFileSync(metaPath, "utf8")) as ModelVariant;
+          let dirty = false;
+          if (meta.parentId === id) { meta.parentId = newId; dirty = true; }
+          if (meta.tokenizerPath === `${oldBase}.tokenizer.json`) {
+            meta.tokenizerPath = `${newBase}.tokenizer.json`;
+            dirty = true;
+          }
+          if (dirty) writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+          const wPath = path.join(this.libraryDir, dir, "weights.bin");
+          if (existsSync(wPath) && lstatSync(wPath).isSymbolicLink() &&
+              readlinkSync(wPath) === path.resolve(`${oldBase}.weights.bin`)) {
+            unlinkSync(wPath);
+            symlinkSync(path.resolve(`${newBase}.weights.bin`), wPath);
+          }
+        } catch { /* skip corrupt variants */ }
+      }
+    }
+    this.emit("library", this.list());
+    return newId;
+  }
+
   // ── Clone & Modify ─────────────────────────────────────────────────────────
 
   clone(sourceId: string, name: string, overrides: Partial<ModelConfig> = {}): ModelVariant {
     const source = this.list().find((v) => v.id === sourceId);
     if (!source) throw new Error(`Unknown source variant: ${sourceId}`);
 
-    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "variant";
+    const slug = slugify(name) || "variant";
     const id = `${slug}-${Date.now().toString(36).slice(-4)}`;
     const dir = path.join(this.libraryDir, id);
     mkdirSync(dir, { recursive: true });

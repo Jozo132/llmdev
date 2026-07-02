@@ -65,7 +65,11 @@ export async function writeGguf(
 ): Promise<number> {
   const meta: Record<string, MetaValue> = {
     "general.architecture": { t: "str", v: "llmdev-tinylm" },
-    "general.name": { t: "str", v: "llmdev PoC checkpoint" },
+    // Name derived from the live parameter configuration — never hardcoded.
+    "general.name": {
+      t: "str",
+      v: `llmdev-tinylm-${(tensors.reduce((s, t) => s + t.data.length, 0) / 1e6).toFixed(2)}M`,
+    },
     "general.alignment": { t: "u32", v: ALIGNMENT },
     "general.file_type": { t: "u32", v: 0 }, // ALL_F32
     "llmdev-tinylm.vocab_size": { t: "u32", v: config.vocabSize },

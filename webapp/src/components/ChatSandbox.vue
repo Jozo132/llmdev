@@ -39,8 +39,8 @@ const SAMPLING_THEORY: Record<string, { theory: string; range: string }> = {
   maxTokens: {
     theory:
       "Generation budget. Each token is a full forward pass — latency and " +
-      "compute scale linearly. No KV-cache in the PoC, so cost per token also " +
-      "grows with accumulated context length.",
+      "compute scale linearly. No KV-cache in this runtime, so cost per token " +
+      "also grows with accumulated context length.",
     range: "16–512",
   },
 };
