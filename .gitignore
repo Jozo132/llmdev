@@ -15,6 +15,10 @@ artifacts/
 .npm/
 *.tsbuildinfo
 
+# native addon build output
+src/native/build/
+src/native/node_modules/
+
 # env
 .env
 .env.local

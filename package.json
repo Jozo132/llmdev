@@ -8,12 +8,14 @@
     "node": ">=22.0.0"
   },
   "scripts": {
+    "serve": "node scripts/serve.mjs",
     "cli": "tsx src/cli.ts",
     "poc": "tsx src/cli.ts run pipelines/poc-js-1m.json",
     "server": "tsx src/server/index.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "webapp:dev": "npm --prefix webapp run dev",
+    "native:build": "npm --prefix src/native install --no-fund --no-audit && npm --prefix src/native run build",
     "disk:check": "bash scripts/disk-guard.sh"
   },
   "dependencies": {

@@ -6,11 +6,19 @@
  */
 import { defineStore } from "pinia";
 import type {
-  ClientMessage, MetricEvent, NodeDescriptor, PipelineStateSnapshot, ServerMessage,
+  ClientMessage, MetricEvent, ModelVariant, NodeDescriptor, PipelineStateSnapshot,
+  ServerMessage, VariantMetric,
 } from "../types";
 
 const WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${location.hostname}:8081`;
 const METRIC_HISTORY = 300;
+
+export interface ChatMessage {
+  role: "user" | "assistant" | "tool";
+  text: string;
+  streaming?: boolean;
+  variantId?: string;
+}
 
 export const usePipelineStore = defineStore("pipeline", {
   state: () => ({
@@ -21,6 +29,14 @@ export const usePipelineStore = defineStore("pipeline", {
     logs: [] as Array<{ nodeId: string; message: string }>,
     selectedNodeId: null as string | null,
     lastError: "" as string,
+    // ── model library ──
+    library: [] as ModelVariant[],
+    variantMetrics: {} as Record<string, VariantMetric[]>, // live sparklines
+    // ── chat sandbox ──
+    chatMessages: [] as ChatMessage[],
+    activeChatId: null as string | null,
+    chatVariantId: null as string | null,
+    mcpLog: [] as unknown[],
     _ws: null as WebSocket | null,
   }),
 
@@ -73,6 +89,39 @@ export const usePipelineStore = defineStore("pipeline", {
         case "error":
           this.lastError = msg.message;
           break;
+        case "library":
+          this.library = msg.variants;
+          if (!this.chatVariantId && msg.variants.length) {
+            this.chatVariantId = msg.variants[0].id;
+          }
+          break;
+        case "variant_metric": {
+          const arr = (this.variantMetrics[msg.metric.variantId] ??= []);
+          arr.push(msg.metric);
+          if (arr.length > METRIC_HISTORY) arr.shift();
+          break;
+        }
+        case "chat_token": {
+          if (msg.chatId !== this.activeChatId) break;
+          const last = this.chatMessages[this.chatMessages.length - 1];
+          if (last?.role === "assistant" && last.streaming) last.text += msg.text;
+          break;
+        }
+        case "chat_done": {
+          if (msg.chatId !== this.activeChatId) break;
+          const last = this.chatMessages[this.chatMessages.length - 1];
+          if (last?.streaming) last.streaming = false;
+          if (msg.reason === "error" && msg.message) this.lastError = msg.message;
+          this.activeChatId = null;
+          break;
+        }
+        case "mcp_result":
+          this.mcpLog.push(msg.payload);
+          this.chatMessages.push({
+            role: "tool",
+            text: JSON.stringify(msg.payload, null, 2),
+          });
+          break;
       }
     },
 
@@ -99,6 +148,38 @@ export const usePipelineStore = defineStore("pipeline", {
       const node = this.state?.nodes.find((n) => n.id === nodeId);
       if (node) node.position = position;
       this.send({ op: "move_node", nodeId, position });
+    },
+
+    // ── model library ──
+    cloneVariant(sourceId: string, name: string, overrides: Record<string, unknown> = {}) {
+      this.send({ op: "library_clone", sourceId, name, overrides });
+    },
+    trainVariant(variantId: string, steps = 30) {
+      this.variantMetrics[variantId] = [];
+      this.send({ op: "library_train", variantId, steps });
+    },
+    stopVariantTraining(variantId: string) {
+      this.send({ op: "library_stop_train", variantId });
+    },
+
+    // ── chat sandbox ──
+    sendChat(prompt: string, maxTokens = 96, temperature = 0.8) {
+      if (!this.chatVariantId || this.activeChatId) return;
+      const chatId = crypto.randomUUID();
+      this.activeChatId = chatId;
+      this.chatMessages.push({ role: "user", text: prompt });
+      this.chatMessages.push({
+        role: "assistant", text: "", streaming: true, variantId: this.chatVariantId,
+      });
+      this.send({
+        op: "chat_send", chatId, variantId: this.chatVariantId, prompt, maxTokens, temperature,
+      });
+    },
+    stopChat() {
+      if (this.activeChatId) this.send({ op: "chat_stop", chatId: this.activeChatId });
+    },
+    sendMcp(payload: unknown) {
+      this.send({ op: "mcp", payload });
     },
   },
 });

@@ -1,41 +1,41 @@
 {
-  "name": "poc-js-1m",
+  "name": "10m-native",
   "nodes": [
     {
       "id": "ingest",
       "type": "data.jsIngestion",
       "position": { "x": 40, "y": 200 },
-      "params": { "dataset": "codeparrot/github-code-clean", "config": "JavaScript-mit", "maxDocs": 300 }
+      "params": { "dataset": "codeparrot/github-code-clean", "config": "JavaScript-mit", "maxDocs": 2000, "maxDocChars": 40000 }
     },
     {
       "id": "tokenize",
       "type": "tokenizer.byteBpe",
       "position": { "x": 300, "y": 200 },
-      "params": { "vocabSize": 8192, "maxTokens": 2000000 }
+      "params": { "vocabSize": 16384, "trainSampleChars": 600000, "maxTokens": 8000000, "outFile": "tokens/js-10m.bin" }
     },
     {
       "id": "arch",
       "type": "model.architecture",
       "position": { "x": 560, "y": 200 },
-      "params": { "dModel": 120, "hiddenDim": 256, "contextLength": 64, "mixer": "causal-mean", "loss": "cross-entropy" }
+      "params": { "dModel": 512, "hiddenDim": 2048, "contextLength": 128, "mixer": "causal-mean", "loss": "cross-entropy" }
     },
     {
       "id": "train",
       "type": "train.poc",
       "position": { "x": 820, "y": 200 },
-      "params": { "steps": 30, "batchSize": 4, "lr": 0.003 }
+      "params": { "steps": 50, "batchSize": 2, "lr": 0.002 }
     },
     {
       "id": "eval",
       "type": "eval.basic",
       "position": { "x": 1080, "y": 200 },
-      "params": { "evalBatches": 4 }
+      "params": { "evalBatches": 4, "batchSize": 2 }
     },
     {
       "id": "export",
       "type": "export.binary",
       "position": { "x": 1340, "y": 200 },
-      "params": { "outFile": "exports/tinylm-poc" }
+      "params": { "outFile": "exports/tinylm-10m" }
     }
   ],
   "edges": [

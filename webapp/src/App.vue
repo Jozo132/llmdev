@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { onMounted, ref } from "vue";
 import { usePipelineStore } from "./stores/pipeline";
 import NodeCanvas from "./components/NodeCanvas.vue";
 import PropertyPanel from "./components/PropertyPanel.vue";
+import WorkspacePanel from "./components/WorkspacePanel.vue";
+import ChatSandbox from "./components/ChatSandbox.vue";
 import MetricsBar from "./components/MetricsBar.vue";
 import LogConsole from "./components/LogConsole.vue";
 
 const store = usePipelineStore();
+const tab = ref<"canvas" | "chat">("canvas");
 onMounted(() => store.connect());
 </script>
 
@@ -17,6 +20,21 @@ onMounted(() => store.connect());
       <h1 class="text-sm font-bold tracking-widest text-slate-400">
         LLMDEV <span class="text-slate-600">/ node-graph playground</span>
       </h1>
+
+      <!-- tabs -->
+      <nav class="flex rounded-lg bg-canvas p-0.5 text-xs">
+        <button
+          class="rounded-md px-3 py-1 font-semibold"
+          :class="tab === 'canvas' ? 'bg-slate-700 text-slate-100' : 'text-slate-500 hover:text-slate-300'"
+          @click="tab = 'canvas'"
+        >⬡ Canvas</button>
+        <button
+          class="rounded-md px-3 py-1 font-semibold"
+          :class="tab === 'chat' ? 'bg-slate-700 text-slate-100' : 'text-slate-500 hover:text-slate-300'"
+          @click="tab = 'chat'"
+        >💬 Chat Sandbox</button>
+      </nav>
+
       <span
         class="rounded-full px-2 py-0.5 text-xs"
         :class="store.connected ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
@@ -44,17 +62,24 @@ onMounted(() => store.connect());
 
     <MetricsBar />
 
-    <!-- Main: canvas + property panel -->
-    <main class="flex min-h-0 flex-1">
+    <!-- Canvas tab: library | SVG playground | properties -->
+    <main v-show="tab === 'canvas'" class="flex min-h-0 flex-1">
+      <WorkspacePanel class="w-72 shrink-0" />
       <NodeCanvas class="min-w-0 flex-1" />
       <PropertyPanel class="w-80 shrink-0 border-l border-slate-800 bg-panel" />
     </main>
 
-    <LogConsole class="h-40 shrink-0 border-t border-slate-800" />
+    <!-- Chat tab: library | conversational sandbox -->
+    <main v-show="tab === 'chat'" class="flex min-h-0 flex-1">
+      <WorkspacePanel class="w-72 shrink-0" />
+      <ChatSandbox />
+    </main>
+
+    <LogConsole v-show="tab === 'canvas'" class="h-40 shrink-0 border-t border-slate-800" />
 
     <div
       v-if="store.lastError"
-      class="fixed bottom-4 left-4 rounded bg-red-900/90 px-4 py-2 text-sm text-red-100 shadow-lg"
+      class="fixed bottom-4 left-4 z-30 rounded bg-red-900/90 px-4 py-2 text-sm text-red-100 shadow-lg"
       @click="store.lastError = ''"
     >
       {{ store.lastError }} <span class="ml-2 cursor-pointer text-xs opacity-60">✕ dismiss</span>

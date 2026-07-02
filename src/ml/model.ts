@@ -13,6 +13,7 @@
  * The Mixer and Loss are injected via src/ml/layers.ts registries.
  */
 import type { ModelConfig } from "../core/types.js";
+import { createBackend, type ComputeBackend } from "./backend.js";
 import { createLoss, createMixer, type LossFn, type SequenceMixer } from "./layers.js";
 
 export interface StepResult {
@@ -38,8 +39,9 @@ export class TinyLM {
 
   private mixer: SequenceMixer;
   private loss: LossFn;
+  readonly backend: ComputeBackend;
 
-  constructor(cfg: ModelConfig) {
+  constructor(cfg: ModelConfig, backend?: ComputeBackend) {
     this.cfg = cfg;
     const { vocabSize: V, dModel: d, contextLength: ctx, hiddenDim: h } = cfg;
     this.oE = 0;
@@ -57,6 +59,10 @@ export class TinyLM {
     this.mixer = createMixer(cfg.mixer);
     this.loss = createLoss(cfg.loss);
     this.initWeights();
+    // The heavy O(V·d) tied-head math is delegated to a backend (CPU or the
+    // N-API CUDA bridge) which pins E + grad-E in device memory.
+    this.backend = backend ?? createBackend();
+    this.backend.init(this.params.subarray(this.oE, this.oE + V * d), V, d);
   }
 
   get paramCount(): number {
@@ -185,7 +191,8 @@ export class TinyLM {
       }
     }
 
-    // ── Adam update over the flat 1M-param buffer ───────────────────────────
+    // ── Adam update over the flat 1M-param buffer ───────────────────────
+    this.backend.flushGradE(g.subarray(this.oE, this.oE + V * d));
     const invB = 1 / batch.length;
     this.adamT++;
     const b1 = 0.9, b2 = 0.999, eps = 1e-8;
@@ -197,6 +204,8 @@ export class TinyLM {
       this.v[i] = b2 * this.v[i] + (1 - b2) * gi * gi;
       p[i] -= (lr * (this.m[i] / c1)) / (Math.sqrt(this.v[i] / c2) + eps);
     }
+    // Weights changed — mirror E to the device (no-op on CPU).
+    this.backend.syncE();
 
     return { loss: totalLoss / batch.length, tokensProcessed: tokens };
   }
@@ -218,23 +227,48 @@ export class TinyLM {
   /** Greedy sampling for smoke-test generations. */
   generate(prompt: Uint16Array, maxNew: number): number[] {
     const out = Array.from(prompt);
-    const ctx = this.cfg.contextLength;
-    for (let n = 0; n < maxNew; n++) {
-      const start = Math.max(0, out.length - (ctx - 1));
-      const window = Uint16Array.from([...out.slice(start), 0]);
-      const next = this.predictLast(window);
-      out.push(next);
-    }
+    for (let n = 0; n < maxNew; n++) out.push(this.nextToken(out, 0));
     return out;
   }
 
-  private predictLast(window: Uint16Array): number {
-    const { vocabSize: V, dModel: d, hiddenDim: h } = this.cfg;
+  /**
+   * Predict the next token for a context (public inference API used by the
+   * Chat Sandbox). temperature 0 ⇒ greedy argmax; >0 ⇒ softmax sampling.
+   */
+  nextToken(contextIds: ArrayLike<number>, temperature = 0): number {
+    const logits = this.logitsFor(contextIds);
+    const V = logits.length;
+    if (temperature <= 0) {
+      let best = 0;
+      for (let i = 1; i < V; i++) if (logits[i] > logits[best]) best = i;
+      return best;
+    }
+    let max = -Infinity;
+    for (let i = 0; i < V; i++) if (logits[i] > max) max = logits[i];
+    let sum = 0;
+    const probs = new Float32Array(V);
+    for (let i = 0; i < V; i++) {
+      probs[i] = Math.exp((logits[i] - max) / temperature);
+      sum += probs[i];
+    }
+    let r = Math.random() * sum;
+    for (let i = 0; i < V; i++) {
+      r -= probs[i];
+      if (r <= 0) return i;
+    }
+    return V - 1;
+  }
+
+  /** Full next-token logits for the last ≤ctx−1 ids of the context. */
+  logitsFor(contextIds: ArrayLike<number>): Float32Array {
+    const { vocabSize: V, dModel: d, hiddenDim: h, contextLength: ctx } = this.cfg;
     const p = this.params;
-    const T = window.length - 1;
+    const all = Array.from(contextIds);
+    const window = all.slice(Math.max(0, all.length - (ctx - 1)));
+    const T = Math.max(1, window.length);
     const x = new Float32Array(T * d);
     for (let t = 0; t < T; t++) {
-      const eOff = this.oE + window[t] * d;
+      const eOff = this.oE + (window[t] ?? 0) * d;
       const pOff = this.oP + t * d;
       for (let j = 0; j < d; j++) x[t * d + j] = p[eOff + j] + p[pOff + j];
     }
@@ -253,17 +287,8 @@ export class TinyLM {
       for (let k = 0; k < h; k++) acc += hid[k] * p[this.oW2 + k * d + j];
       y[j] = acc;
     }
-    let best = 0;
-    let bestV = -Infinity;
-    for (let i = 0; i < V; i++) {
-      let acc = 0;
-      const eOff = this.oE + i * d;
-      for (let j = 0; j < d; j++) acc += y[j] * p[eOff + j];
-      if (acc > bestV) {
-        bestV = acc;
-        best = i;
-      }
-    }
-    return best;
+    const logits = new Float32Array(V);
+    this.backend.logitsForward(y, logits);
+    return logits;
   }
 }

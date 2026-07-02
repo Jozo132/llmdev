@@ -8,14 +8,17 @@ import { statSync } from "node:fs";
 import path from "node:path";
 import type {
   ExportedArtifact, NodeDescriptor, NodeParams, NodeRunContext, PipelineNode,
-  TrainedModelHandle,
+  TokenizerHandle, TrainedModelHandle,
 } from "../../core/types.js";
 
 const DESCRIPTOR: NodeDescriptor = {
   type: "export.binary",
   label: "Export Checkpoint",
   category: "export",
-  inputs: [{ name: "model", dataType: "model", required: true }],
+  inputs: [
+    { name: "model", dataType: "model", required: true },
+    { name: "tokenizer", dataType: "tokenizer" },
+  ],
   outputs: [{ name: "artifact", dataType: "artifact" }],
   paramSchema: [
     { key: "outFile", label: "Output file", type: "string", default: "exports/tinylm-poc" },
@@ -35,6 +38,7 @@ export class ExportNode implements PipelineNode {
 
   async run(inputs: Record<string, unknown>, ctx: NodeRunContext) {
     const handle = inputs.model as TrainedModelHandle;
+    const tokenizer = inputs.tokenizer as TokenizerHandle | undefined;
     if (!handle) throw new Error("ExportNode requires 'model' input");
     const base = path.join(ctx.artifactsDir, String(this.params.outFile));
 
@@ -52,6 +56,11 @@ export class ExportNode implements PipelineNode {
       `${base}.weights.bin`,
       Buffer.from(handle.weights.buffer, handle.weights.byteOffset, handle.weights.byteLength)
     );
+    // Persist the tokenizer next to the checkpoint so the Chat Sandbox and
+    // LibraryManager can run standalone inference on this artifact.
+    if (tokenizer) {
+      await writeFile(`${base}.tokenizer.json`, JSON.stringify(tokenizer.toJSON()));
+    }
 
     const bytes = statSync(`${base}.weights.bin`).size;
     ctx.log(`Exported ${base}.{json,weights.bin} — ${(bytes / 1024 / 1024).toFixed(2)}MB`);
