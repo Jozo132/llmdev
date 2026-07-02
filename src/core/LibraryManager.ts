@@ -53,9 +53,7 @@ export interface VariantMetric {
   tokensPerSec: number;
 }
 
-const paramCountOf = (c: ModelConfig): number =>
-  c.vocabSize * c.dModel + c.contextLength * c.dModel +
-  c.dModel * c.hiddenDim + c.hiddenDim + c.hiddenDim * c.dModel + c.dModel;
+const paramCountOf = (c: ModelConfig): number => TinyLM.paramCountFor(c);
 
 const slugify = (name: string): string =>
   name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");

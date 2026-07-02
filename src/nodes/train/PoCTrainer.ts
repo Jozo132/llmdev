@@ -93,8 +93,11 @@ export class PoCTrainer implements PipelineNode {
 
     const model = new TinyLM(config);
     ctx.log(`TinyLM instantiated: ${model.paramCount.toLocaleString()} parameters ` +
-            `(${(model.paramCount * 4 / 1024 / 1024).toFixed(1)}MB fp32)`);
+            `across ${model.nLayers} transformer layer(s) ` +
+            `(${(model.paramCount * 4 / 1024 / 1024).toFixed(1)}MB fp32) — ` +
+            `forward runs layers 0→${model.nLayers - 1}, backward ${model.nLayers - 1}→0`);
     ctx.metric("param_count", model.paramCount);
+    ctx.metric("layer_count", model.nLayers);
 
     const sampleWindow = (): Uint16Array => {
       const start = Math.floor(Math.random() * (data.length - windowLen));

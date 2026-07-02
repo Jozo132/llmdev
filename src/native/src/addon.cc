@@ -20,6 +20,9 @@ void llm_ctx_sync_e(void* ctx, const float* E);
 void llm_ctx_logits_forward(void* ctx, const float* y, float* logits);
 void llm_ctx_logits_backward(void* ctx, const float* y, const float* dLogits, float* dY);
 void llm_ctx_flush_grad_e(void* ctx, float* gE);
+void llm_ctx_alloc_buffers(void* ctx, int nLayers, int d, int h);
+void llm_ctx_sync_layer(void* ctx, int layer, const float* wq, const float* wk,
+                        const float* wv, const float* wg, const float* wd);
 int llm_attn_last_forward(const float* x, int T, int d, float* out);
 void llm_sgemm(const float* A, const float* B, float* C, int M, int K, int N);
 }
@@ -81,6 +84,25 @@ Napi::Value ReleaseContext(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// allocLayers(ctx, nLayers, d, h) — discrete per-layer device weight buffers:
+// w_attention_queries[l], w_attention_keys[l], w_attention_values[l],
+// w_mlp_gate[l], w_mlp_down[l] for l ∈ [0, nLayers).
+Napi::Value AllocLayers(const Napi::CallbackInfo& info) {
+  llm_ctx_alloc_buffers(info[0].As<Napi::External<void>>().Data(),
+                        info[1].As<Napi::Number>().Int32Value(),
+                        info[2].As<Napi::Number>().Int32Value(),
+                        info[3].As<Napi::Number>().Int32Value());
+  return info.Env().Undefined();
+}
+
+// syncLayer(ctx, layer, wq[d*d], wk[d*d], wv[d*d], wGate[d*h], wDown[h*d])
+Napi::Value SyncLayer(const Napi::CallbackInfo& info) {
+  llm_ctx_sync_layer(info[0].As<Napi::External<void>>().Data(),
+                     info[1].As<Napi::Number>().Int32Value(),
+                     F32(info[2]), F32(info[3]), F32(info[4]), F32(info[5]), F32(info[6]));
+  return info.Env().Undefined();
+}
+
 // attnLastForward(x[T*d], T, d, out[T*d]) → bool (false = use CPU fallback)
 Napi::Value AttnLastForward(const Napi::CallbackInfo& info) {
   int ok = llm_attn_last_forward(F32(info[0]),
@@ -108,6 +130,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("logitsForward", Napi::Function::New(env, LogitsForward));
   exports.Set("logitsBackward", Napi::Function::New(env, LogitsBackward));
   exports.Set("flushGradE", Napi::Function::New(env, FlushGradE));
+  exports.Set("allocLayers", Napi::Function::New(env, AllocLayers));
+  exports.Set("syncLayer", Napi::Function::New(env, SyncLayer));
   exports.Set("attnLastForward", Napi::Function::New(env, AttnLastForward));
   exports.Set("sgemm", Napi::Function::New(env, Sgemm));
   return exports;

@@ -13,6 +13,7 @@ import type {
 const WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${location.hostname}:8881`;
 const METRIC_HISTORY = 300;
 const ANALYTICS_HISTORY = 50_000; // non-truncated historic charts (safety cap)
+const GRAPH_SAVE_DEBOUNCE_MS = 600; // coalesce drag/param bursts into one save
 
 export interface ChatMessage {
   role: "user" | "assistant" | "tool";
@@ -48,6 +49,10 @@ export const usePipelineStore = defineStore("pipeline", {
     chatVariantId: null as string | null,
     mcpLog: [] as unknown[],
     mcpTools: [] as Array<{ name: string; description: string }>,
+    // ── project persistence (SQLite warehouse) ──
+    projects: [] as Array<{ id: string; name: string; updatedAt: number }>,
+    activeProjectId: "default" as string,
+    _saveTimer: null as ReturnType<typeof setTimeout> | null,
     _ws: null as WebSocket | null,
   }),
 
@@ -169,6 +174,9 @@ export const usePipelineStore = defineStore("pipeline", {
         case "workers":
           this.workers = msg.workers;
           break;
+        case "projects":
+          this.projects = msg.projects;
+          break;
         case "worker_event":
           break; // reserved: remote-worker telemetry mirror
       }
@@ -176,6 +184,42 @@ export const usePipelineStore = defineStore("pipeline", {
 
     send(msg: ClientMessage) {
       this._ws?.send(JSON.stringify(msg));
+    },
+
+    /**
+     * Debounced graph persistence: every create/rename/delete/param-update/
+     * node-move coalesces into ONE save_graph frame; the server replaces the
+     * project's layout state transactionally in the SQLite warehouse.
+     */
+    scheduleGraphSave() {
+      if (this._saveTimer) clearTimeout(this._saveTimer);
+      this._saveTimer = setTimeout(() => {
+        this._saveTimer = null;
+        this.send({ op: "save_graph", projectId: this.activeProjectId, name: this.state?.name });
+      }, GRAPH_SAVE_DEBOUNCE_MS);
+    },
+
+    loadProject(projectId: string) {
+      this.switchGraphProject(projectId);
+    },
+
+    /**
+     * Switch the canvas to another project's individually stored graph.
+     * Any pending debounced save is flushed under the OLD project first so
+     * edits are never written into the wrong workspace; the server then
+     * restores the target graph (or adopts the current one on first open).
+     */
+    switchGraphProject(projectId: string, name?: string) {
+      if (projectId === this.activeProjectId) return;
+      if (this._saveTimer) {
+        clearTimeout(this._saveTimer);
+        this._saveTimer = null;
+        this.send({ op: "save_graph", projectId: this.activeProjectId, name: this.state?.name });
+      }
+      this.activeProjectId = projectId;
+      this.metrics = {};
+      this.selectedNodeId = null;
+      this.send({ op: "load_project", projectId, name });
     },
 
     run() {
@@ -208,21 +252,26 @@ export const usePipelineStore = defineStore("pipeline", {
     //    the engine validates types/cycles and is the source of truth) ──
     addNode(node: NodeInstanceSpec) {
       this.send({ op: "add_node", node });
+      this.scheduleGraphSave();
     },
     removeNode(nodeId: string) {
       if (this.selectedNodeId === nodeId) this.selectedNodeId = null;
       this.send({ op: "remove_node", nodeId });
+      this.scheduleGraphSave();
     },
     addEdge(edge: EdgeSpec) {
       this.send({ op: "add_edge", edge });
+      this.scheduleGraphSave();
     },
     removeEdge(edge: EdgeSpec) {
       this.send({ op: "remove_edge", edge });
+      this.scheduleGraphSave();
     },
     applyTemplate(templateId: string) {
       this.metrics = {};
       this.selectedNodeId = null;
       this.send({ op: "apply_template", templateId });
+      this.scheduleGraphSave();
     },
 
     updateParams(nodeId: string, params: Record<string, unknown>) {
@@ -230,12 +279,14 @@ export const usePipelineStore = defineStore("pipeline", {
       const node = this.state?.nodes.find((n) => n.id === nodeId);
       if (node) node.params = { ...node.params, ...params };
       this.send({ op: "update_params", nodeId, params });
+      this.scheduleGraphSave();
     },
 
     moveNode(nodeId: string, position: { x: number; y: number }) {
       const node = this.state?.nodes.find((n) => n.id === nodeId);
       if (node) node.position = position;
       this.send({ op: "move_node", nodeId, position });
+      this.scheduleGraphSave();
     },
 
     // ── model library ──
@@ -247,10 +298,13 @@ export const usePipelineStore = defineStore("pipeline", {
     },
     deleteVariant(variantId: string) {
       if (this.chatVariantId === variantId) this.chatVariantId = null;
+      if (this.activeProjectId === variantId) this.activeProjectId = "default";
       this.send({ op: "library_delete", variantId });
+      this.send({ op: "delete_project", projectId: variantId }); // drop its stored graph
     },
     renameVariant(variantId: string, name: string) {
       this.send({ op: "library_rename", variantId, name });
+      this.send({ op: "rename_project", projectId: variantId, name }); // keep stored graph in sync
     },
     /**
      * Active-process blocker: opening another model while BPE tokenization or
@@ -264,6 +318,12 @@ export const usePipelineStore = defineStore("pipeline", {
         return;
       }
       this.chatVariantId = variantId;
+      this.activateVariantGraph(variantId);
+    },
+    /** Each library variant owns its own SQLite-stored graph configuration. */
+    activateVariantGraph(variantId: string) {
+      const variant = this.library.find((v) => v.id === variantId);
+      this.switchGraphProject(variantId, variant?.name);
     },
     confirmForceOpen() {
       // Destroy the active context: abort the pipeline (frees worker threads /
@@ -272,7 +332,10 @@ export const usePipelineStore = defineStore("pipeline", {
       for (const v of this.library) {
         if (v.training) this.send({ op: "library_stop_train", variantId: v.id });
       }
-      if (this.pendingOpenId) this.chatVariantId = this.pendingOpenId;
+      if (this.pendingOpenId) {
+        this.chatVariantId = this.pendingOpenId;
+        this.activateVariantGraph(this.pendingOpenId);
+      }
       this.pendingOpenId = null;
     },
     cancelPendingOpen() {

@@ -24,6 +24,17 @@ export interface ComputeBackend {
   logitsBackward(y: Float32Array, dLogits: Float32Array, dY: Float32Array): void;
   /** Drain the internal grad-E accumulator into the host buffer (+=) and clear. */
   flushGradE(gE: Float32Array): void;
+  /**
+   * Allocate discrete per-layer device weight buffers (Wq/Wk/Wv/Wgate/Wdown
+   * for each of nLayers transformer blocks). No-op on CPU.
+   */
+  initLayers?(nLayers: number, d: number, h: number): void;
+  /** Mirror one layer's weight matrices to its device buffers. No-op on CPU. */
+  syncLayer?(
+    layer: number,
+    wq: Float32Array, wk: Float32Array, wv: Float32Array,
+    wGate: Float32Array, wDown: Float32Array
+  ): void;
   dispose(): void;
 }
 
@@ -87,6 +98,12 @@ interface NativeAddon {
   logitsForward(ctx: unknown, y: Float32Array, logits: Float32Array): void;
   logitsBackward(ctx: unknown, y: Float32Array, dLogits: Float32Array, dY: Float32Array): void;
   flushGradE(ctx: unknown, gE: Float32Array): void;
+  allocLayers(ctx: unknown, nLayers: number, d: number, h: number): void;
+  syncLayer(
+    ctx: unknown, layer: number,
+    wq: Float32Array, wk: Float32Array, wv: Float32Array,
+    wGate: Float32Array, wDown: Float32Array
+  ): void;
   attnLastForward(x: Float32Array, T: number, d: number, out: Float32Array): boolean;
   sgemm(A: Float32Array, B: Float32Array, C: Float32Array, M: number, K: number, N: number): void;
 }
@@ -156,6 +173,21 @@ class CudaBackend implements ComputeBackend {
 
   flushGradE(gE: Float32Array): void {
     addon!.flushGradE(this.ctx, gE);
+  }
+
+  initLayers(nLayers: number, d: number, h: number): void {
+    // Discrete cudaMalloc per layer — w_attention_{q,k,v}[l], w_mlp_gate[l],
+    // w_mlp_down[l] each get their own device pointer (no monolithic slab, so
+    // depth changes never force a full realloc of the weight arena).
+    addon!.allocLayers(this.ctx, nLayers, d, h);
+  }
+
+  syncLayer(
+    layer: number,
+    wq: Float32Array, wk: Float32Array, wv: Float32Array,
+    wGate: Float32Array, wDown: Float32Array
+  ): void {
+    addon!.syncLayer(this.ctx, layer, wq, wk, wv, wGate, wDown);
   }
 
   dispose(): void {

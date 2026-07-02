@@ -17,10 +17,24 @@
     }                                                                        \
   } while (0)
 
-// Persistent GPU context for one model's tied output head:
+// Kernel launches fail SILENTLY (e.g. cudaErrorNoKernelImageForDevice when
+// the binary lacks SASS/PTX for the running GPU) unless explicitly checked —
+// the subsequent cudaMemcpy would still succeed and return stale zeros,
+// which starves the whole backward pass of gradient. Always check.
+#define CUDA_CHECK_LAUNCH()                                                  \
+  do {                                                                       \
+    cudaError_t _e = cudaGetLastError();                                     \
+    if (_e != cudaSuccess) {                                                 \
+      fprintf(stderr, "CUDA kernel launch error %s at %s:%d\n",              \
+              cudaGetErrorString(_e), __FILE__, __LINE__);                   \
+    }                                                                        \
+  } while (0)
+
+// Persistent GPU context for one model:
 // the embedding matrix E [V×d] lives on-device across the whole training run,
-// and the E-gradient accumulates on-device — host↔device traffic per token is
-// only y (d floats), logits (V floats) and dLogits (V floats).
+// the E-gradient accumulates on-device, and each transformer layer owns a set
+// of DISCRETE device weight buffers (allocated per layer index, never as one
+// monolithic slab — depth changes cannot fragment or force a full realloc).
 struct LlmCtx {
   float* dE;    // device E            [V*d]
   float* dGE;   // device grad-E accum [V*d]
@@ -29,6 +43,14 @@ struct LlmCtx {
   int V;
   int d;
   bool freed;   // explicit-release guard (cancel_training) vs GC finalizer
+  // ── per-layer transformer weights (arrays of discrete device pointers) ──
+  int nLayers;                 // 0 until llm_ctx_alloc_buffers is called
+  int hidden;                  // MLP hidden dim h
+  float** w_attention_queries; // [nLayers] → device [d*d]
+  float** w_attention_keys;    // [nLayers] → device [d*d]
+  float** w_attention_values;  // [nLayers] → device [d*d]
+  float** w_mlp_gate;          // [nLayers] → device [d*h]
+  float** w_mlp_down;          // [nLayers] → device [h*d]
 };
 
 // ── Kernels ──────────────────────────────────────────────────────────────────
@@ -180,7 +202,8 @@ int llm_device_name(char* buf, int len) {
 }
 
 void* llm_ctx_create(const float* E, int V, int d) {
-  LlmCtx* ctx = new LlmCtx{nullptr, nullptr, nullptr, nullptr, V, d, false};
+  LlmCtx* ctx = new LlmCtx{nullptr, nullptr, nullptr, nullptr, V, d, false,
+                           0, 0, nullptr, nullptr, nullptr, nullptr, nullptr};
   size_t ed = (size_t)V * d * sizeof(float);
   CUDA_CHECK(cudaMalloc(&ctx->dE, ed));
   CUDA_CHECK(cudaMalloc(&ctx->dGE, ed));
@@ -189,6 +212,59 @@ void* llm_ctx_create(const float* E, int V, int d) {
   CUDA_CHECK(cudaMemcpy(ctx->dE, E, ed, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemset(ctx->dGE, 0, ed));
   return ctx;
+}
+
+// Allocate the multi-layer weight arena: loop through nLayers and give every
+// layer index its own discrete cudaMalloc'd buffers — w_attention_queries[l],
+// w_attention_keys[l], w_attention_values[l], w_mlp_gate[l], w_mlp_down[l].
+// Idempotent-safe: re-allocation with a new depth frees the old arrays first.
+void llm_ctx_alloc_buffers(void* p, int nLayers, int d, int h) {
+  LlmCtx* ctx = (LlmCtx*)p;
+  if (ctx->freed) return;
+  if (ctx->nLayers > 0) {
+    for (int l = 0; l < ctx->nLayers; l++) {
+      cudaFree(ctx->w_attention_queries[l]);
+      cudaFree(ctx->w_attention_keys[l]);
+      cudaFree(ctx->w_attention_values[l]);
+      cudaFree(ctx->w_mlp_gate[l]);
+      cudaFree(ctx->w_mlp_down[l]);
+    }
+    delete[] ctx->w_attention_queries;
+    delete[] ctx->w_attention_keys;
+    delete[] ctx->w_attention_values;
+    delete[] ctx->w_mlp_gate;
+    delete[] ctx->w_mlp_down;
+  }
+  ctx->nLayers = nLayers;
+  ctx->hidden = h;
+  ctx->w_attention_queries = new float*[nLayers];
+  ctx->w_attention_keys = new float*[nLayers];
+  ctx->w_attention_values = new float*[nLayers];
+  ctx->w_mlp_gate = new float*[nLayers];
+  ctx->w_mlp_down = new float*[nLayers];
+  size_t dd = (size_t)d * d * sizeof(float);
+  size_t dh = (size_t)d * h * sizeof(float);
+  for (int l = 0; l < nLayers; l++) {
+    CUDA_CHECK(cudaMalloc(&ctx->w_attention_queries[l], dd));
+    CUDA_CHECK(cudaMalloc(&ctx->w_attention_keys[l], dd));
+    CUDA_CHECK(cudaMalloc(&ctx->w_attention_values[l], dd));
+    CUDA_CHECK(cudaMalloc(&ctx->w_mlp_gate[l], dh));
+    CUDA_CHECK(cudaMalloc(&ctx->w_mlp_down[l], dh));
+  }
+}
+
+// Push one layer's weight matrices host→device (after each optimizer step).
+void llm_ctx_sync_layer(void* p, int layer, const float* wq, const float* wk,
+                        const float* wv, const float* wg, const float* wd) {
+  LlmCtx* ctx = (LlmCtx*)p;
+  if (ctx->freed || layer < 0 || layer >= ctx->nLayers) return;
+  size_t dd = (size_t)ctx->d * ctx->d * sizeof(float);
+  size_t dh = (size_t)ctx->d * ctx->hidden * sizeof(float);
+  CUDA_CHECK(cudaMemcpy(ctx->w_attention_queries[layer], wq, dd, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(ctx->w_attention_keys[layer], wk, dd, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(ctx->w_attention_values[layer], wv, dd, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(ctx->w_mlp_gate[layer], wg, dh, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(ctx->w_mlp_down[layer], wd, dh, cudaMemcpyHostToDevice));
 }
 
 // Explicit GPU release for cancel_training: frees device buffers immediately
@@ -201,6 +277,23 @@ void llm_ctx_release_buffers(void* p) {
   cudaFree(ctx->dY);
   cudaFree(ctx->dLog);
   ctx->dE = ctx->dGE = ctx->dY = ctx->dLog = nullptr;
+  for (int l = 0; l < ctx->nLayers; l++) {
+    cudaFree(ctx->w_attention_queries[l]);
+    cudaFree(ctx->w_attention_keys[l]);
+    cudaFree(ctx->w_attention_values[l]);
+    cudaFree(ctx->w_mlp_gate[l]);
+    cudaFree(ctx->w_mlp_down[l]);
+  }
+  if (ctx->nLayers > 0) {
+    delete[] ctx->w_attention_queries;
+    delete[] ctx->w_attention_keys;
+    delete[] ctx->w_attention_values;
+    delete[] ctx->w_mlp_gate;
+    delete[] ctx->w_mlp_down;
+    ctx->w_attention_queries = ctx->w_attention_keys = ctx->w_attention_values = nullptr;
+    ctx->w_mlp_gate = ctx->w_mlp_down = nullptr;
+    ctx->nLayers = 0;
+  }
   ctx->freed = true;
 }
 
@@ -222,6 +315,7 @@ void llm_ctx_logits_forward(void* p, const float* y, float* logits) {
   if (ctx->freed) return;
   CUDA_CHECK(cudaMemcpy(ctx->dY, y, ctx->d * sizeof(float), cudaMemcpyHostToDevice));
   k_logits_forward<<<ctx->V, 256>>>(ctx->dE, ctx->dY, ctx->dLog, ctx->V, ctx->d);
+  CUDA_CHECK_LAUNCH();
   CUDA_CHECK(cudaMemcpy(logits, ctx->dLog, ctx->V * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
@@ -234,7 +328,9 @@ void llm_ctx_logits_backward(void* p, const float* y, const float* dLogits, floa
   int blocks = (int)((total + 255) / 256);
   if (blocks > 65535) blocks = 65535;
   k_grad_e_acc<<<blocks, 256>>>(ctx->dGE, ctx->dLog, ctx->dY, ctx->V, ctx->d);
+  CUDA_CHECK_LAUNCH();
   k_dy<<<(ctx->d + 127) / 128, 128>>>(ctx->dE, ctx->dLog, ctx->dY, ctx->V, ctx->d);
+  CUDA_CHECK_LAUNCH();
   CUDA_CHECK(cudaMemcpy(dY, ctx->dY, ctx->d * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
@@ -260,6 +356,14 @@ int llm_attn_last_forward(const float* x, int T, int d, float* out) {
   CUDA_CHECK(cudaMalloc(&dOut, bytes));
   CUDA_CHECK(cudaMemcpy(dX, x, bytes, cudaMemcpyHostToDevice));
   k_attn_last_forward<<<1, 256, d * sizeof(float)>>>(dX, T, d, dOut);
+  cudaError_t launchErr = cudaGetLastError();
+  if (launchErr != cudaSuccess) {
+    fprintf(stderr, "CUDA kernel launch error %s at %s:%d\n",
+            cudaGetErrorString(launchErr), __FILE__, __LINE__);
+    cudaFree(dX);
+    cudaFree(dOut);
+    return 0; // signal CPU fallback instead of returning stale zeros
+  }
   CUDA_CHECK(cudaMemcpy(out + (long)(T - 1) * d, dOut + (long)(T - 1) * d,
                         d * sizeof(float), cudaMemcpyDeviceToHost));
   cudaFree(dX);
@@ -277,6 +381,7 @@ void llm_sgemm(const float* A, const float* B, float* C, int M, int K, int N) {
   dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
   dim3 block(TILE, TILE);
   k_sgemm<<<grid, block>>>(dA, dB, dC, M, K, N);
+  CUDA_CHECK_LAUNCH();
   CUDA_CHECK(cudaMemcpy(C, dC, (size_t)M * N * sizeof(float), cudaMemcpyDeviceToHost));
   cudaFree(dA);
   cudaFree(dB);

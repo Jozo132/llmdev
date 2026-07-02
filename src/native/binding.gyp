@@ -33,8 +33,8 @@
             "--use_fast_math",
             "-std=c++17",
             "-Xcompiler", "-fPIC",
-            "-gencode", "arch=compute_89,code=sm_89",
-            "-gencode", "arch=compute_90,code=sm_90"
+            "-gencode", "arch=compute_120,code=sm_120",
+            "-gencode", "arch=compute_90,code=compute_90"
           ]
         }
       ]

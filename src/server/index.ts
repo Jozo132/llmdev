@@ -37,13 +37,51 @@ const mcp = createMcpHandler(library);
 // Active chat generations, cancellable per chatId.
 const chatAborts = new Map<string, AbortController>();
 
+const DEFAULT_PROJECT_ID = "default";
+
+/** Snapshot the live engine graph into the SQLite warehouse (one transaction). */
+function persistGraph(projectId = DEFAULT_PROJECT_ID, name?: string): void {
+  const snap = engine.snapshot();
+  datasets.saveGraph(
+    projectId,
+    name ?? snap.name ?? "untitled",
+    snap.nodes.map((n) => ({
+      id: n.id,
+      type: n.type,
+      x: n.position?.x ?? 0,
+      y: n.position?.y ?? 0,
+      params: n.params ?? {},
+    })),
+    snap.edges.map((e) => ({
+      id: `${e.from.node}.${e.from.port}->${e.to.node}.${e.to.port}`,
+      from: e.from,
+      to: e.to,
+    }))
+  );
+  broker.broadcast({ ev: "projects", projects: datasets.listProjects() });
+}
+
+/** Rehydrate a saved project graph into the engine (⇒ state broadcast). */
+function restoreProject(projectId: string): boolean {
+  const graph = datasets.loadGraph(projectId);
+  if (!graph) return false;
+  const spec: PipelineSpec = {
+    name: graph.project.name,
+    nodes: graph.nodes.map((n) => ({
+      id: n.id, type: n.type, params: n.params, position: { x: n.x, y: n.y },
+    })),
+    edges: graph.edges.map((e) => ({ from: e.from, to: e.to })),
+  };
+  engine.load(spec);
+  return true;
+}
+
 // Optionally preload a pipeline: `npm run server -- pipelines/poc-js-1m.json`
 const preload = process.argv[2];
 if (preload) {
   engine.load(JSON.parse(readFileSync(preload, "utf8")) as PipelineSpec);
   console.log(`Preloaded pipeline: ${preload}`);
 }
-
 // ── Token-by-token local chat inference ──────────────────────────────
 async function runChat(
   chatId: string, variantId: string, prompt: string,
@@ -154,6 +192,22 @@ function handleOp(msg: ClientMessage, send: (msg: ServerMessage) => void): void 
     case "mcp":
       void mcp(msg.payload).then((payload) => send({ ev: "mcp_result", payload }));
       return;
+    case "save_graph":
+      return persistGraph(msg.projectId ?? DEFAULT_PROJECT_ID, msg.name);
+    case "load_project":
+      // First open for this project (e.g. a library variant that never had a
+      // graph): adopt the current canvas as its initial configuration so
+      // every variant owns an individually stored topology from then on.
+      if (!restoreProject(msg.projectId)) persistGraph(msg.projectId, msg.name);
+      return;
+    case "list_projects":
+      return send({ ev: "projects", projects: datasets.listProjects() });
+    case "rename_project":
+      datasets.renameProject(msg.projectId, msg.name);
+      return broker.broadcast({ ev: "projects", projects: datasets.listProjects() });
+    case "delete_project":
+      datasets.deleteProject(msg.projectId);
+      return broker.broadcast({ ev: "projects", projects: datasets.listProjects() });
     default:
       return send({ ev: "error", message: `Unknown op` });
   }
@@ -168,6 +222,7 @@ const broker = new MessageBroker({
     templates: () => TEMPLATES,
     library: () => library.list(),
     datasets: () => datasets.list(),
+    projects: () => datasets.listProjects(),
   },
   onUiConnect: (send) => {
     send({ ev: "catalog", descriptors: listDescriptors() });
@@ -175,6 +230,7 @@ const broker = new MessageBroker({
     send({ ev: "state", state: engine.snapshot() });
     send({ ev: "library", variants: library.list() });
     send({ ev: "workers", workers: broker.listWorkers() });
+    send({ ev: "projects", projects: datasets.listProjects() });
   },
 });
 
@@ -191,6 +247,11 @@ library.on("library", (variants) => broker.broadcast({ ev: "library", variants }
 library.on("metric", (metric) => broker.broadcast({ ev: "variant_metric", metric }));
 
 broker.listen();
+
+// Resume the last saved workspace unless a pipeline file was preloaded.
+if (!preload && restoreProject(DEFAULT_PROJECT_ID)) {
+  console.log(`Restored saved workspace "${DEFAULT_PROJECT_ID}" from warehouse`);
+}
 
 console.log(`llmdev coordinator listening on http+ws://localhost:${PORT}  (ws /  ·  ws /worker  ·  REST /api/*)`);
 console.log(

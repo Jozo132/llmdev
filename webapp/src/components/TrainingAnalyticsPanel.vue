@@ -57,6 +57,22 @@ const charts = computed<Chart[]>(() => [
       { label: "RSS", color: "#ec4899", points: store.history.rss_mb ?? [] },
     ],
   },
+  {
+    title: "Eval Perplexity",
+    unit: "ppl",
+    series: [
+      { label: "held-out ppl", color: "#22d3ee", points: store.history.eval_perplexity ?? [] },
+    ],
+  },
+  {
+    title: "MCP Tool-Calling Accuracy",
+    unit: "%",
+    series: [
+      { label: "functional", color: "#10b981", points: store.history.tool_accuracy ?? [] },
+      { label: "syntax", color: "#f59e0b", points: store.history.tool_syntax_accuracy ?? [] },
+      { label: "schema", color: "#8b5cf6", points: store.history.tool_schema_accuracy ?? [] },
+    ],
+  },
 ]);
 
 /** Shared y-domain across a chart's series; x = sample index (full history). */

@@ -119,6 +119,7 @@ export interface VariantMetric {
 
 export type ServerMessage =
   | { ev: "state"; state: PipelineStateSnapshot }
+  | { ev: "projects"; projects: Array<{ id: string; name: string; updatedAt: number }> }
   | { ev: "catalog"; descriptors: NodeDescriptor[] }
   | { ev: "templates"; templates: ArchTemplate[] }
   | { ev: "metric"; metric: MetricEvent }
@@ -159,4 +160,9 @@ export type ClientMessage =
   | { op: "library_stop_train"; variantId: string }
   | { op: "chat_send"; chatId: string; variantId: string; prompt: string; maxTokens?: number; temperature?: number; topP?: number }
   | { op: "chat_stop"; chatId: string }
-  | { op: "mcp"; payload: unknown };
+  | { op: "mcp"; payload: unknown }
+  | { op: "save_graph"; projectId?: string; name?: string }
+  | { op: "load_project"; projectId: string; name?: string }
+  | { op: "list_projects" }
+  | { op: "rename_project"; projectId: string; name: string }
+  | { op: "delete_project"; projectId: string };

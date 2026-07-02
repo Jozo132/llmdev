@@ -16,6 +16,13 @@
  *               Any model shape pulls the same pre-tokenized stream with zero
  *               reprocessing overhead; shard granularity keeps single rows
  *               small enough for incremental batched transactions.
+ *
+ *   projects     — visual IDE workspaces (id, name, updated_at).
+ *   graph_nodes  — per-project canvas topology: node type, layout x/y, and
+ *                  the full hyperparameter bag as a JSON blob.
+ *   graph_edges  — per-project port-level wiring between nodes.
+ *   Graph saves run as a single REPLACE transaction so a reload always sees
+ *   a consistent snapshot of the last committed layout.
  */
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
@@ -29,6 +36,32 @@ export interface DatasetMeta {
   vocabSize: number;
   tokenCount: number;
   createdAt: string;
+}
+
+export interface ProjectMeta {
+  id: string;
+  name: string;
+  updatedAt: number;
+}
+
+export interface GraphNodeRow {
+  id: string;
+  type: string;
+  x: number;
+  y: number;
+  params: Record<string, unknown>;
+}
+
+export interface GraphEdgeRow {
+  id: string;
+  from: { node: string; port: string };
+  to: { node: string; port: string };
+}
+
+export interface ProjectGraph {
+  project: ProjectMeta;
+  nodes: GraphNodeRow[];
+  edges: GraphEdgeRow[];
 }
 
 export interface ShardWriter {
@@ -75,6 +108,29 @@ export class DatasetDB {
         PRIMARY KEY (dataset_id, seq)
       ) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS idx_datasets_key ON datasets(key);
+      CREATE TABLE IF NOT EXISTS projects (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS graph_nodes (
+        project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        node_id     TEXT NOT NULL,
+        type        TEXT NOT NULL,
+        x           REAL NOT NULL DEFAULT 0,
+        y           REAL NOT NULL DEFAULT 0,
+        properties  TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (project_id, node_id)
+      ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS graph_edges (
+        project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        edge_id         TEXT NOT NULL,
+        source_node_id  TEXT NOT NULL,
+        source_port     TEXT NOT NULL,
+        target_node_id  TEXT NOT NULL,
+        target_port     TEXT NOT NULL,
+        PRIMARY KEY (project_id, edge_id)
+      ) WITHOUT ROWID;
     `);
     this.db.pragma("foreign_keys = ON");
   }
@@ -211,6 +267,73 @@ export class DatasetDB {
 
   delete(key: string): void {
     this.db.prepare(`DELETE FROM datasets WHERE key = ?`).run(key);
+  }
+
+  // ── Project / visual-graph persistence ────────────────────────────────────
+
+  listProjects(): ProjectMeta[] {
+    return this.db
+      .prepare(`SELECT id, name, updated_at AS updatedAt FROM projects ORDER BY updated_at DESC`)
+      .all() as ProjectMeta[];
+  }
+
+  /**
+   * Atomically replace the full topology state (nodes + edges + layout) for a
+   * project. One transaction ⇒ a concurrent reload never observes a
+   * half-written graph.
+   */
+  saveGraph(projectId: string, name: string, nodes: GraphNodeRow[], edges: GraphEdgeRow[]): void {
+    const db = this.db;
+    const upsertProject = db.prepare(
+      `INSERT INTO projects (id, name, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`
+    );
+    const insNode = db.prepare(
+      `INSERT INTO graph_nodes (project_id, node_id, type, x, y, properties) VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    const insEdge = db.prepare(
+      `INSERT INTO graph_edges (project_id, edge_id, source_node_id, source_port, target_node_id, target_port)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    db.transaction(() => {
+      upsertProject.run(projectId, name, Date.now());
+      db.prepare(`DELETE FROM graph_nodes WHERE project_id = ?`).run(projectId);
+      db.prepare(`DELETE FROM graph_edges WHERE project_id = ?`).run(projectId);
+      for (const n of nodes) {
+        insNode.run(projectId, n.id, n.type, n.x, n.y, JSON.stringify(n.params ?? {}));
+      }
+      for (const e of edges) {
+        insEdge.run(projectId, e.id, e.from.node, e.from.port, e.to.node, e.to.port);
+      }
+    })();
+  }
+
+  loadGraph(projectId: string): ProjectGraph | null {
+    const project = this.db
+      .prepare(`SELECT id, name, updated_at AS updatedAt FROM projects WHERE id = ?`)
+      .get(projectId) as ProjectMeta | undefined;
+    if (!project) return null;
+    const nodes = (this.db
+      .prepare(`SELECT node_id AS id, type, x, y, properties FROM graph_nodes WHERE project_id = ?`)
+      .all(projectId) as Array<{ id: string; type: string; x: number; y: number; properties: string }>)
+      .map((r) => ({ id: r.id, type: r.type, x: r.x, y: r.y, params: JSON.parse(r.properties) as Record<string, unknown> }));
+    const edges = (this.db
+      .prepare(
+        `SELECT edge_id AS id, source_node_id AS sn, source_port AS sp,
+                target_node_id AS tn, target_port AS tp
+           FROM graph_edges WHERE project_id = ?`
+      )
+      .all(projectId) as Array<{ id: string; sn: string; sp: string; tn: string; tp: string }>)
+      .map((r) => ({ id: r.id, from: { node: r.sn, port: r.sp }, to: { node: r.tn, port: r.tp } }));
+    return { project, nodes, edges };
+  }
+
+  renameProject(projectId: string, name: string): void {
+    this.db.prepare(`UPDATE projects SET name = ?, updated_at = ? WHERE id = ?`).run(name, Date.now(), projectId);
+  }
+
+  deleteProject(projectId: string): void {
+    this.db.prepare(`DELETE FROM projects WHERE id = ?`).run(projectId);
   }
 
   close(): void {

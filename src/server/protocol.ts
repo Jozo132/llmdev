@@ -41,7 +41,13 @@ export type ClientMessage =
   | { op: "chat_send"; chatId: string; variantId: string; prompt: string; maxTokens?: number; temperature?: number; topP?: number }
   | { op: "chat_stop"; chatId: string }
   // ── MCP: JSON-RPC 2.0 envelope (initialize / tools/list / tools/call) ──
-  | { op: "mcp"; payload: unknown };
+  | { op: "mcp"; payload: unknown }
+  // ── project / visual-graph persistence (SQLite warehouse) ──
+  | { op: "save_graph"; projectId?: string; name?: string }   // persist current engine graph
+  | { op: "load_project"; projectId: string; name?: string }  // restore (or adopt current graph on first open)
+  | { op: "list_projects" }
+  | { op: "rename_project"; projectId: string; name: string }
+  | { op: "delete_project"; projectId: string };
 
 // Server → Client
 export type ServerMessage =
@@ -56,6 +62,7 @@ export type ServerMessage =
   | { ev: "chat_token"; chatId: string; token: number; text: string }
   | { ev: "chat_done"; chatId: string; reason: "complete" | "stopped" | "error"; message?: string }
   | { ev: "mcp_result"; payload: unknown }
+  | { ev: "projects"; projects: Array<{ id: string; name: string; updatedAt: number }> }
   // ── horizontal scaling: remote compute workers ──
   | { ev: "workers"; workers: Array<{ id: string; capabilities: Record<string, unknown>; connectedAt: string }> }
   | { ev: "worker_event"; workerId: string; payload: unknown };

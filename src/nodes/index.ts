@@ -9,6 +9,7 @@ import { TokenizerNode, tokenizerDescriptor } from "./tokenizer/TokenizerNode.js
 import { ModelArchitectureNode, modelArchitectureDescriptor } from "./model/ModelArchitectureNode.js";
 import { PoCTrainer, pocTrainerDescriptor } from "./train/PoCTrainer.js";
 import { EvaluationNode, evaluationDescriptor } from "./eval/EvaluationNode.js";
+import { EvaluationHarnessNode, evaluationHarnessDescriptor } from "./eval/EvaluationHarnessNode.js";
 import { ExportNode, exportDescriptor } from "./export/ExportNode.js";
 
 registerNode(jsIngestionDescriptor, (p) => new JsIngestionNode(p));
@@ -16,4 +17,5 @@ registerNode(tokenizerDescriptor, (p) => new TokenizerNode(p));
 registerNode(modelArchitectureDescriptor, (p) => new ModelArchitectureNode(p));
 registerNode(pocTrainerDescriptor, (p) => new PoCTrainer(p));
 registerNode(evaluationDescriptor, (p) => new EvaluationNode(p));
+registerNode(evaluationHarnessDescriptor, (p) => new EvaluationHarnessNode(p));
 registerNode(exportDescriptor, (p) => new ExportNode(p));
