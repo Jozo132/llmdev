@@ -1,0 +1,72 @@
+// Dev Container for llmdev — Linux Mint 22.3 host, NVIDIA RTX 5060 Ti (Blackwell / sm_120).
+// Requires on the HOST: docker + nvidia-container-toolkit ("sudo nvidia-ctk runtime configure --runtime=docker").
+{
+  "name": "llmdev (Node 22 + CUDA 12.8)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  // ── GPU passthrough ────────────────────────────────────────────────────────
+  "hostRequirements": { "gpu": true },
+  "runArgs": [
+    "--gpus=all",
+    "--shm-size=2g",
+    // Hard cap on container tmpfs so /tmp can never balloon into the 100GB budget.
+    "--tmpfs", "/tmp:rw,size=2g"
+  ],
+  "containerEnv": {
+    "NVIDIA_VISIBLE_DEVICES": "all",
+    "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+
+    // ── Disk policy: ALL caches redirected to a single named volume ─────────
+    // One volume = one place to measure (`npm run disk:check`) and one place
+    // to nuke (`docker volume rm llmdev-cache`) without rebuilding the image.
+    "HF_HOME": "/cache/hf",
+    "HF_HUB_ENABLE_HF_TRANSFER": "1",
+    "HF_DATASETS_CACHE": "/cache/hf/datasets",
+    "TRANSFORMERS_CACHE": "/cache/hf/transformers",
+    "npm_config_cache": "/cache/npm",
+    "PIP_CACHE_DIR": "/cache/pip",
+    "PIP_NO_CACHE_DIR": "0",
+    "LLMDEV_ARTIFACTS_DIR": "/artifacts",
+    "LLMDEV_DISK_BUDGET_GB": "100"
+  },
+
+  // ── Mounts: keep heavy write traffic OUT of the container's overlay layer ─
+  "mounts": [
+    // Unified cache volume (HF streams, npm, pip). Prunable at any time.
+    "source=llmdev-cache,target=/cache,type=volume",
+    // Artifacts volume: tokenized .bin shards, checkpoints, exports.
+    // Named volume ⇒ survives container rebuilds, trivially auditable.
+    "source=llmdev-artifacts,target=/artifacts,type=volume",
+    // node_modules as a volume: faster on Linux, keeps overlay layer slim.
+    "source=llmdev-node-modules,target=${containerWorkspaceFolder}/node_modules,type=volume",
+    "source=llmdev-webapp-node-modules,target=${containerWorkspaceFolder}/webapp/node_modules,type=volume"
+  ],
+
+  "forwardPorts": [8081, 5173],
+  "portsAttributes": {
+    "8081": { "label": "Pipeline WebSocket bridge" },
+    "5173": { "label": "Vue 3 webapp (Vite)" }
+  },
+
+  "remoteUser": "dev",
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "Vue.volar",
+        "bradlc.vscode-tailwindcss",
+        "ms-python.python"
+      ],
+      "settings": {
+        "typescript.tsdk": "node_modules/typescript/lib",
+        "files.exclude": { "**/dist": true }
+      }
+    }
+  }
+}

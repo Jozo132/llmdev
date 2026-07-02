@@ -1,0 +1,51 @@
+{
+  "name": "poc-js-1m",
+  "nodes": [
+    {
+      "id": "ingest",
+      "type": "data.jsIngestion",
+      "position": { "x": 40, "y": 200 },
+      "params": { "dataset": "codeparrot/github-code-clean", "config": "JavaScript-mit", "maxDocs": 300 }
+    },
+    {
+      "id": "tokenize",
+      "type": "tokenizer.byteBpe",
+      "position": { "x": 300, "y": 200 },
+      "params": { "vocabSize": 8192, "maxTokens": 2000000 }
+    },
+    {
+      "id": "arch",
+      "type": "model.architecture",
+      "position": { "x": 560, "y": 200 },
+      "params": { "dModel": 120, "hiddenDim": 256, "contextLength": 64, "mixer": "causal-mean", "loss": "cross-entropy" }
+    },
+    {
+      "id": "train",
+      "type": "train.poc",
+      "position": { "x": 820, "y": 200 },
+      "params": { "steps": 30, "batchSize": 4, "lr": 0.003 }
+    },
+    {
+      "id": "eval",
+      "type": "eval.basic",
+      "position": { "x": 1080, "y": 200 },
+      "params": { "evalBatches": 4 }
+    },
+    {
+      "id": "export",
+      "type": "export.binary",
+      "position": { "x": 1340, "y": 200 },
+      "params": { "outFile": "exports/tinylm-poc" }
+    }
+  ],
+  "edges": [
+    { "from": { "node": "ingest", "port": "text" }, "to": { "node": "tokenize", "port": "text" } },
+    { "from": { "node": "tokenize", "port": "tokens" }, "to": { "node": "arch", "port": "tokens" } },
+    { "from": { "node": "arch", "port": "config" }, "to": { "node": "train", "port": "config" } },
+    { "from": { "node": "arch", "port": "tokens" }, "to": { "node": "train", "port": "tokens" } },
+    { "from": { "node": "train", "port": "model" }, "to": { "node": "eval", "port": "model" } },
+    { "from": { "node": "arch", "port": "tokens" }, "to": { "node": "eval", "port": "tokens" } },
+    { "from": { "node": "tokenize", "port": "tokenizer" }, "to": { "node": "eval", "port": "tokenizer" } },
+    { "from": { "node": "eval", "port": "model" }, "to": { "node": "export", "port": "model" } }
+  ]
+}

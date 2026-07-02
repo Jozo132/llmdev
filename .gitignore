@@ -1,0 +1,20 @@
+# deps / build
+node_modules/
+dist/
+webapp/node_modules/
+webapp/dist/
+
+# artifacts — NEVER commit datasets, tokens, or checkpoints (100GB budget!)
+artifacts/
+*.bin
+*.ckpt.json
+*.safetensors
+
+# caches
+.cache/
+.npm/
+*.tsbuildinfo
+
+# env
+.env
+.env.local

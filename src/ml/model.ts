@@ -1,0 +1,269 @@
+/**
+ * TinyLM — a deliberately "dumb" ~1M parameter language model in pure TS.
+ *
+ * Architecture (per position t):
+ *   x_t   = E[token_t] + P[t]                    (embeddings, learned)
+ *   m_t   = Mixer(x_{0..t})                      (injectable attention slot)
+ *   h_t   = relu(m_t · W1 + b1)                  (MLP up)
+ *   y_t   = h_t · W2 + b2                        (MLP down)
+ *   logit = y_t · Eᵀ                             (weight-tied output head)
+ *
+ * Backward pass is EXACT (hand-derived) for every parameter — this is a real
+ * gradient-descent trainer, not a mock — while staying small enough to audit.
+ * The Mixer and Loss are injected via src/ml/layers.ts registries.
+ */
+import type { ModelConfig } from "../core/types.js";
+import { createLoss, createMixer, type LossFn, type SequenceMixer } from "./layers.js";
+
+export interface StepResult {
+  loss: number;
+  tokensProcessed: number;
+}
+
+export class TinyLM {
+  readonly cfg: ModelConfig;
+  readonly params: Float32Array;   // single flat buffer — "the 1M weight array"
+  readonly grads: Float32Array;
+  private readonly m: Float32Array; // Adam moment 1
+  private readonly v: Float32Array; // Adam moment 2
+  private adamT = 0;
+
+  // Views into the flat buffer (offsets, row-major).
+  private readonly oE: number;   // [V × d]
+  private readonly oP: number;   // [ctx × d]
+  private readonly oW1: number;  // [d × h]
+  private readonly oB1: number;  // [h]
+  private readonly oW2: number;  // [h × d]
+  private readonly oB2: number;  // [d]
+
+  private mixer: SequenceMixer;
+  private loss: LossFn;
+
+  constructor(cfg: ModelConfig) {
+    this.cfg = cfg;
+    const { vocabSize: V, dModel: d, contextLength: ctx, hiddenDim: h } = cfg;
+    this.oE = 0;
+    this.oP = this.oE + V * d;
+    this.oW1 = this.oP + ctx * d;
+    this.oB1 = this.oW1 + d * h;
+    this.oW2 = this.oB1 + h;
+    this.oB2 = this.oW2 + h * d;
+    const total = this.oB2 + d;
+
+    this.params = new Float32Array(total);
+    this.grads = new Float32Array(total);
+    this.m = new Float32Array(total);
+    this.v = new Float32Array(total);
+    this.mixer = createMixer(cfg.mixer);
+    this.loss = createLoss(cfg.loss);
+    this.initWeights();
+  }
+
+  get paramCount(): number {
+    return this.params.length;
+  }
+
+  private initWeights(): void {
+    // Small deterministic-ish gaussian init (Box–Muller).
+    const scale = 0.02;
+    for (let i = 0; i < this.params.length; i++) {
+      const u1 = Math.random() || 1e-9;
+      const u2 = Math.random();
+      this.params[i] = scale * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    }
+  }
+
+  /**
+   * One training step on a batch of token windows.
+   * Each window predicts its LAST token from the preceding context
+   * (keeps pure-JS compute tractable; per-position loss is a drop-in later).
+   */
+  step(batch: Uint16Array[], lr: number): StepResult {
+    const { vocabSize: V, dModel: d, hiddenDim: h } = this.cfg;
+    const p = this.params;
+    const g = this.grads;
+    g.fill(0);
+
+    let totalLoss = 0;
+    let tokens = 0;
+
+    // Reusable scratch buffers (no per-step allocation churn ⇒ no OOM creep).
+    const dLogits = new Float32Array(V);
+
+    for (const window of batch) {
+      const T = window.length - 1;      // context positions
+      const target = window[T];         // next-token target
+      tokens += window.length;
+
+      // ── Forward ────────────────────────────────────────────────────────────
+      const x = new Float32Array(T * d);
+      for (let t = 0; t < T; t++) {
+        const eOff = this.oE + window[t] * d;
+        const pOff = this.oP + t * d;
+        for (let j = 0; j < d; j++) x[t * d + j] = p[eOff + j] + p[pOff + j];
+      }
+
+      const mix = new Float32Array(T * d);
+      this.mixer.forward(x, T, d, mix);
+      const mLast = mix.subarray((T - 1) * d, T * d); // predict from final state
+
+      const hid = new Float32Array(h);
+      for (let k = 0; k < h; k++) {
+        let acc = p[this.oB1 + k];
+        for (let j = 0; j < d; j++) acc += mLast[j] * p[this.oW1 + j * h + k];
+        hid[k] = acc > 0 ? acc : 0; // relu
+      }
+
+      const y = new Float32Array(d);
+      for (let j = 0; j < d; j++) {
+        let acc = p[this.oB2 + j];
+        for (let k = 0; k < h; k++) acc += hid[k] * p[this.oW2 + k * d + j];
+        y[j] = acc;
+      }
+
+      // Tied output head: logits[i] = y · E[i]
+      const logits = new Float32Array(V);
+      for (let i = 0; i < V; i++) {
+        let acc = 0;
+        const eOff = this.oE + i * d;
+        for (let j = 0; j < d; j++) acc += y[j] * p[eOff + j];
+        logits[i] = acc;
+      }
+
+      // ── Loss + Backward ────────────────────────────────────────────────────
+      totalLoss += this.loss.compute(logits, target, dLogits);
+
+      // d y and d E (tied head): logits = E · y
+      const dY = new Float32Array(d);
+      for (let i = 0; i < V; i++) {
+        const dl = dLogits[i];
+        if (dl === 0) continue;
+        const eOff = this.oE + i * d;
+        for (let j = 0; j < d; j++) {
+          dY[j] += dl * p[eOff + j];
+          g[eOff + j] += dl * y[j];
+        }
+      }
+
+      // MLP down: y = hid·W2 + b2
+      const dHid = new Float32Array(h);
+      for (let j = 0; j < d; j++) {
+        const dyj = dY[j];
+        g[this.oB2 + j] += dyj;
+        for (let k = 0; k < h; k++) {
+          g[this.oW2 + k * d + j] += hid[k] * dyj;
+          dHid[k] += p[this.oW2 + k * d + j] * dyj;
+        }
+      }
+
+      // relu + MLP up: hid = relu(mLast·W1 + b1)
+      const dMLast = new Float32Array(d);
+      for (let k = 0; k < h; k++) {
+        if (hid[k] <= 0) continue; // relu gate
+        const dhk = dHid[k];
+        g[this.oB1 + k] += dhk;
+        for (let j = 0; j < d; j++) {
+          g[this.oW1 + j * h + k] += mLast[j] * dhk;
+          dMLast[j] += p[this.oW1 + j * h + k] * dhk;
+        }
+      }
+
+      // Mixer backward: only the last mixed state received gradient.
+      const dMix = new Float32Array(T * d);
+      dMix.set(dMLast, (T - 1) * d);
+      const dX = new Float32Array(T * d);
+      this.mixer.backward(dMix, T, d, dX);
+
+      // Embedding + positional gradients.
+      for (let t = 0; t < T; t++) {
+        const eOff = this.oE + window[t] * d;
+        const pOff = this.oP + t * d;
+        for (let j = 0; j < d; j++) {
+          g[eOff + j] += dX[t * d + j];
+          g[pOff + j] += dX[t * d + j];
+        }
+      }
+    }
+
+    // ── Adam update over the flat 1M-param buffer ───────────────────────────
+    const invB = 1 / batch.length;
+    this.adamT++;
+    const b1 = 0.9, b2 = 0.999, eps = 1e-8;
+    const c1 = 1 - Math.pow(b1, this.adamT);
+    const c2 = 1 - Math.pow(b2, this.adamT);
+    for (let i = 0; i < p.length; i++) {
+      const gi = g[i] * invB;
+      this.m[i] = b1 * this.m[i] + (1 - b1) * gi;
+      this.v[i] = b2 * this.v[i] + (1 - b2) * gi * gi;
+      p[i] -= (lr * (this.m[i] / c1)) / (Math.sqrt(this.v[i] / c2) + eps);
+    }
+
+    return { loss: totalLoss / batch.length, tokensProcessed: tokens };
+  }
+
+  /** Loss-only evaluation (no gradient accumulation side effects kept). */
+  evalLoss(batch: Uint16Array[]): number {
+    const saved = this.params.slice();
+    const savedM = this.m.slice();
+    const savedV = this.v.slice();
+    const savedT = this.adamT;
+    const { loss } = this.step(batch, 0); // lr=0 ⇒ params unchanged by update
+    this.params.set(saved);
+    this.m.set(savedM);
+    this.v.set(savedV);
+    this.adamT = savedT;
+    return loss;
+  }
+
+  /** Greedy sampling for smoke-test generations. */
+  generate(prompt: Uint16Array, maxNew: number): number[] {
+    const out = Array.from(prompt);
+    const ctx = this.cfg.contextLength;
+    for (let n = 0; n < maxNew; n++) {
+      const start = Math.max(0, out.length - (ctx - 1));
+      const window = Uint16Array.from([...out.slice(start), 0]);
+      const next = this.predictLast(window);
+      out.push(next);
+    }
+    return out;
+  }
+
+  private predictLast(window: Uint16Array): number {
+    const { vocabSize: V, dModel: d, hiddenDim: h } = this.cfg;
+    const p = this.params;
+    const T = window.length - 1;
+    const x = new Float32Array(T * d);
+    for (let t = 0; t < T; t++) {
+      const eOff = this.oE + window[t] * d;
+      const pOff = this.oP + t * d;
+      for (let j = 0; j < d; j++) x[t * d + j] = p[eOff + j] + p[pOff + j];
+    }
+    const mix = new Float32Array(T * d);
+    this.mixer.forward(x, T, d, mix);
+    const mLast = mix.subarray((T - 1) * d, T * d);
+    const hid = new Float32Array(h);
+    for (let k = 0; k < h; k++) {
+      let acc = p[this.oB1 + k];
+      for (let j = 0; j < d; j++) acc += mLast[j] * p[this.oW1 + j * h + k];
+      hid[k] = acc > 0 ? acc : 0;
+    }
+    const y = new Float32Array(d);
+    for (let j = 0; j < d; j++) {
+      let acc = p[this.oB2 + j];
+      for (let k = 0; k < h; k++) acc += hid[k] * p[this.oW2 + k * d + j];
+      y[j] = acc;
+    }
+    let best = 0;
+    let bestV = -Infinity;
+    for (let i = 0; i < V; i++) {
+      let acc = 0;
+      const eOff = this.oE + i * d;
+      for (let j = 0; j < d; j++) acc += y[j] * p[eOff + j];
+      if (acc > bestV) {
+        bestV = acc;
+        best = i;
+      }
+    }
+    return best;
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "name": "llmdev",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local LLM research framework — plug-and-play node-graph pipeline (headless CLI + WebSocket bridge) with a 1M-param PoC trainer.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "cli": "tsx src/cli.ts",
+    "poc": "tsx src/cli.ts run pipelines/poc-js-1m.json",
+    "server": "tsx src/server/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "webapp:dev": "npm --prefix webapp run dev",
+    "disk:check": "bash scripts/disk-guard.sh"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
