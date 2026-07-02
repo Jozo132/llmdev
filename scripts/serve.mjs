@@ -14,6 +14,9 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PIPELINE = process.argv[2] ?? "pipelines/poc-js-1m.json";
 
+// Load secrets (HF_TOKEN…) from the gitignored .env, if present.
+try { process.loadEnvFile(path.join(root, ".env")); } catch { /* no .env — fine */ }
+
 const C = { engine: "\x1b[36m", webapp: "\x1b[35m", serve: "\x1b[33m", reset: "\x1b[0m" };
 const log = (tag, line) => console.log(`${C[tag]}[${tag}]${C.reset} ${line}`);
 

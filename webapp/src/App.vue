@@ -7,9 +7,10 @@ import WorkspacePanel from "./components/WorkspacePanel.vue";
 import ChatSandbox from "./components/ChatSandbox.vue";
 import MetricsBar from "./components/MetricsBar.vue";
 import LogConsole from "./components/LogConsole.vue";
+import TrainingAnalyticsPanel from "./components/TrainingAnalyticsPanel.vue";
 
 const store = usePipelineStore();
-const tab = ref<"canvas" | "chat">("canvas");
+const tab = ref<"canvas" | "chat" | "analytics">("canvas");
 onMounted(() => store.connect());
 </script>
 
@@ -33,6 +34,11 @@ onMounted(() => store.connect());
           :class="tab === 'chat' ? 'bg-slate-700 text-slate-100' : 'text-slate-500 hover:text-slate-300'"
           @click="tab = 'chat'"
         >💬 Chat Sandbox</button>
+        <button
+          class="rounded-md px-3 py-1 font-semibold"
+          :class="tab === 'analytics' ? 'bg-slate-700 text-slate-100' : 'text-slate-500 hover:text-slate-300'"
+          @click="tab = 'analytics'"
+        >📈 Analytics</button>
       </nav>
 
       <span
@@ -66,6 +72,14 @@ onMounted(() => store.connect());
           ⏵ Resume
         </button>
         <button
+          v-if="store.state?.running"
+          class="rounded bg-emerald-600 px-3 py-1 text-xs font-bold text-emerald-50 hover:bg-emerald-500"
+          title="Commit & Proceed — stop iterating now, freeze weights + Adam moments, finish the node as done and fire downstream steps"
+          @click="store.commitTraining()"
+        >
+          ✔ Commit &amp; Proceed
+        </button>
+        <button
           class="rounded bg-red-800 px-3 py-1 text-xs font-semibold hover:bg-red-700 disabled:opacity-40"
           :disabled="!store.state?.running"
           title="Abort the run and release the GPU context"
@@ -92,6 +106,11 @@ onMounted(() => store.connect());
     <!-- Chat tab: immersive widescreen — canvas & config panels hidden -->
     <main v-show="tab === 'chat'" class="flex min-h-0 flex-1">
       <ChatSandbox />
+    </main>
+
+    <!-- Analytics tab: widescreen historic charts + runtime controls -->
+    <main v-show="tab === 'analytics'" class="flex min-h-0 flex-1">
+      <TrainingAnalyticsPanel />
     </main>
 
     <LogConsole v-show="tab === 'canvas'" class="h-40 shrink-0 border-t border-slate-800" />

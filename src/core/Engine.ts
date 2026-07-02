@@ -37,6 +37,8 @@ export class Engine extends EventEmitter {
   private abort: AbortController | null = null;
   private _paused = false;
   private pauseWaiters: Array<() => void> = [];
+  /** "Commit Early" flag — scoped to the currently executing node. */
+  private commitFlag = false;
   readonly artifactsDir: string;
 
   constructor(artifactsDir = process.env.LLMDEV_ARTIFACTS_DIR ?? "artifacts") {
@@ -77,6 +79,17 @@ export class Engine extends EventEmitter {
   stop(): void {
     this.abort?.abort();
     this.resume();
+  }
+
+  /**
+   * "Commit & Proceed": interrupt the remaining iterations of the running
+   * training node, freeze weights + Adam moments exactly where they are, and
+   * let the node finish as 'done' so downstream nodes fire automatically.
+   */
+  commitEarly(): void {
+    if (!this.running) return;
+    this.commitFlag = true;
+    this.resume(); // wake a paused loop so it can observe the commit
   }
 
   private waitIfPaused = async (): Promise<void> => {
@@ -255,16 +268,53 @@ export class Engine extends EventEmitter {
 
         rt.status = "running";
         this.emitState();
+        // ── High-resolution profiling + windowed velocity/ETA tracking ─────
+        const startTime = performance.now();
+        let lastTickTime = startTime;
+        // Rolling window of (time, progress) samples for velocity estimation.
+        const window: Array<{ t: number; p: number }> = [];
+        const WINDOW_MS = 15_000;
+        const WINDOW_MAX = 32;
         const emitMetric = (name: string, value: number, extra?: Record<string, unknown>): void => {
           const ev: MetricEvent = { ts: Date.now(), nodeId: id, name, value, extra };
           this.emit("metric", ev);
+          if (name !== "node_progress") return;
+          // Derive elapsedTimeMs + windowed rolling-average etaMs.
+          const now = performance.now();
+          lastTickTime = now;
+          window.push({ t: now, p: value });
+          while (window.length > WINDOW_MAX || (window.length > 2 && now - window[0].t > WINDOW_MS)) {
+            window.shift();
+          }
+          const elapsed = now - startTime;
+          this.emit("metric", { ts: Date.now(), nodeId: id, name: "elapsed_ms", value: elapsed } as MetricEvent);
+          const first = window[0];
+          const dp = value - first.p;
+          const dt = now - first.t;
+          if (dp > 1e-6 && dt > 0 && value < 1) {
+            const velocity = dp / dt; // progress per ms over the window
+            this.emit("metric", {
+              ts: Date.now(), nodeId: id, name: "eta_ms",
+              value: (1 - value) / velocity,
+              extra: { velocity, elapsedMs: elapsed },
+            } as MetricEvent);
+          }
         };
-        const t0 = performance.now(); // high-resolution per-node profiling
         emitMetric("node_progress", 0);
+        // Keep the elapsed clock ticking even between progress updates.
+        const clock = setInterval(() => {
+          this.emit("metric", {
+            ts: Date.now(), nodeId: id, name: "elapsed_ms",
+            value: performance.now() - startTime,
+            extra: { sinceTickMs: performance.now() - lastTickTime },
+          } as MetricEvent);
+        }, 1000);
+        this.commitFlag = false; // commit control is scoped per node
         try {
           rt.outputs = await rt.node.run(inputs, {
             artifactsDir: this.artifactsDir,
             signal,
+            shouldCommit: () => this.commitFlag,
             waitIfPaused: this.waitIfPaused,
             metric: emitMetric,
             log: (message) => this.emit("log", { nodeId: id, message }),
@@ -276,7 +326,9 @@ export class Engine extends EventEmitter {
           rt.error = err instanceof Error ? err.message : String(err);
           this.emit("log", { nodeId: id, message: `ERROR: ${rt.error}` });
         }
-        emitMetric("execution_time_ms", performance.now() - t0);
+        clearInterval(clock);
+        this.commitFlag = false;
+        emitMetric("execution_time_ms", performance.now() - startTime);
         this.emitState();
       }
     } finally {

@@ -1,27 +1,37 @@
 /**
- * WebSocket bridge — serializes the live node-tree, streams training metrics
- * (loss, tokens/sec, VRAM), and accepts execution/edit commands from clients.
+ * Compute coordinator — binds the Engine/Library/Warehouse to the transport-
+ * agnostic MessageBroker.
  *
- *   npm run server            → ws://localhost:8881
+ *   npm run server            → http+ws://localhost:8881
  *
- * The same Engine instance backs both this server and the CLI, so a pipeline
+ * Planes (see broker.ts):
+ *   WS  /          UI protocol (ClientMessage/ServerMessage)
+ *   WS  /worker    remote compute workers (register / task / event)
+ *   REST /api/*    state · catalog · templates · library · datasets · POST op
+ *
+ * The same Engine instance backs the broker and the CLI, so a pipeline
  * started headlessly is mirrored on every connected canvas in real time.
  */
 import { readFileSync } from "node:fs";
-import { WebSocketServer, WebSocket } from "ws";
 import "../nodes/index.js"; // register built-in node types
+
+// Load secrets (HF_TOKEN…) from the gitignored .env when run standalone.
+try { process.loadEnvFile(".env"); } catch { /* no .env — fine */ }
 import { Engine } from "../core/Engine.js";
 import { LibraryManager } from "../core/LibraryManager.js";
+import { getDatasetDB } from "../core/DatasetDB.js";
 import { listDescriptors } from "../core/Registry.js";
 import { TEMPLATES } from "../core/templates.js";
 import { cudaAvailable, cudaDeviceName } from "../ml/backend.js";
 import type { PipelineSpec } from "../core/types.js";
+import { MessageBroker } from "./broker.js";
 import { createMcpHandler } from "./mcp.js";
 import type { ClientMessage, ServerMessage } from "./protocol.js";
 
 const PORT = Number(process.env.LLMDEV_WS_PORT ?? 8881);
 const engine = new Engine();
 const library = new LibraryManager(engine.artifactsDir);
+const datasets = getDatasetDB(engine.artifactsDir);
 const mcp = createMcpHandler(library);
 
 // Active chat generations, cancellable per chatId.
@@ -33,28 +43,6 @@ if (preload) {
   engine.load(JSON.parse(readFileSync(preload, "utf8")) as PipelineSpec);
   console.log(`Preloaded pipeline: ${preload}`);
 }
-
-const wss = new WebSocketServer({ port: PORT });
-const clients = new Set<WebSocket>();
-
-function broadcast(msg: ServerMessage): void {
-  const data = JSON.stringify(msg);
-  for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
-  }
-}
-
-// Engine events → all clients.
-engine.on("state", (state) => broadcast({ ev: "state", state }));
-engine.on("metric", (metric) => broadcast({ ev: "metric", metric }));
-engine.on("log", ({ nodeId, message }) => {
-  console.log(`[${nodeId}] ${message}`);
-  broadcast({ ev: "log", nodeId, message });
-});
-
-// Library events → all clients (variant list changes + live benchmark points).
-library.on("library", (variants) => broadcast({ ev: "library", variants }));
-library.on("metric", (metric) => broadcast({ ev: "variant_metric", metric }));
 
 // ── Token-by-token local chat inference ──────────────────────────────
 async function runChat(
@@ -68,17 +56,17 @@ async function runChat(
     const ids: number[] = Array.from(tokenizer.encode(prompt));
     for (let n = 0; n < maxTokens; n++) {
       if (abort.signal.aborted) {
-        broadcast({ ev: "chat_done", chatId, reason: "stopped" });
+        broker.broadcast({ ev: "chat_done", chatId, reason: "stopped" });
         return;
       }
       const token = model.nextToken(ids, temperature, topP);
       ids.push(token);
-      broadcast({ ev: "chat_token", chatId, token, text: tokenizer.decode([token]) });
+      broker.broadcast({ ev: "chat_token", chatId, token, text: tokenizer.decode([token]) });
       await new Promise((r) => setImmediate(r)); // stream frames between tokens
     }
-    broadcast({ ev: "chat_done", chatId, reason: "complete" });
+    broker.broadcast({ ev: "chat_done", chatId, reason: "complete" });
   } catch (err) {
-    broadcast({
+    broker.broadcast({
       ev: "chat_done", chatId, reason: "error",
       message: err instanceof Error ? err.message : String(err),
     });
@@ -87,110 +75,124 @@ async function runChat(
   }
 }
 
-wss.on("connection", (ws) => {
-  clients.add(ws);
-  const send = (msg: ServerMessage) => ws.send(JSON.stringify(msg));
-  // Sync new clients immediately.
-  send({ ev: "catalog", descriptors: listDescriptors() });
-  send({ ev: "templates", templates: TEMPLATES });
-  send({ ev: "state", state: engine.snapshot() });
-  send({ ev: "library", variants: library.list() });
-
-  ws.on("message", (raw) => {
-    let msg: ClientMessage;
-    try {
-      msg = JSON.parse(String(raw)) as ClientMessage;
-    } catch {
-      return send({ ev: "error", message: "Invalid JSON" });
-    }
-    try {
-      switch (msg.op) {
-        case "get_state":
-          return send({ ev: "state", state: engine.snapshot() });
-        case "get_catalog":
-          return send({ ev: "catalog", descriptors: listDescriptors() });
-        case "load_pipeline":
-          engine.load(msg.spec);
-          return;
-        case "run":
-          if (!engine.running) {
-            engine.run().catch((err) =>
-              broadcast({ ev: "error", message: err instanceof Error ? err.message : String(err) })
-            );
-          }
-          return;
-        case "stop":
-          return engine.stop();
-        case "pause_training":
-          return engine.pause();
-        case "resume_training":
-          return engine.resume();
-        case "cancel_training":
-          return engine.stop(); // abort + wake paused nodes; trainer frees GPU ctx
-        case "update_params":
-          return engine.updateNodeParams(msg.nodeId, msg.params);
-        case "move_node":
-          return engine.updateNodePosition(msg.nodeId, msg.position);
-        case "add_node":
-          return engine.addNode(msg.node);
-        case "remove_node":
-          return engine.removeNode(msg.nodeId);
-        case "add_edge":
-          return engine.addEdge(msg.edge);
-        case "remove_edge":
-          return engine.removeEdge(msg.edge);
-        case "get_templates":
-          return send({ ev: "templates", templates: TEMPLATES });
-        case "apply_template": {
-          const tpl = TEMPLATES.find((t) => t.id === msg.templateId);
-          if (!tpl) throw new Error(`Unknown template: ${msg.templateId}`);
-          // Deep-copy so canvas edits never mutate the pristine template.
-          engine.load(JSON.parse(JSON.stringify(tpl.spec)));
-          return;
-        }
-        case "library_list":
-          return send({ ev: "library", variants: library.list() });
-        case "library_create":
-          library.create(msg.name, msg.overrides ?? {});
-          return;
-        case "library_delete":
-          return library.delete(msg.variantId);
-        case "library_rename":
-          library.rename(msg.variantId, msg.name);
-          return;
-        case "library_clone":
-          library.clone(msg.sourceId, msg.name, msg.overrides ?? {});
-          return;
-        case "library_train":
-          library
-            .train(msg.variantId, { steps: msg.steps, batchSize: msg.batchSize, lr: msg.lr })
-            .catch((err) =>
-              send({ ev: "error", message: err instanceof Error ? err.message : String(err) })
-            );
-          return;
-        case "library_stop_train":
-          return library.stopTraining(msg.variantId);
-        case "chat_send":
-          void runChat(msg.chatId, msg.variantId, msg.prompt, msg.maxTokens ?? 96, msg.temperature ?? 0.8, msg.topP ?? 1);
-          return;
-        case "chat_stop":
-          chatAborts.get(msg.chatId)?.abort();
-          return;
-        case "mcp":
-          void mcp(msg.payload).then((payload) => send({ ev: "mcp_result", payload }));
-          return;
-        default:
-          return send({ ev: "error", message: `Unknown op` });
+// ── Coordinator op dispatch (shared by UI WS frames and REST POST /api/op) ──
+function handleOp(msg: ClientMessage, send: (msg: ServerMessage) => void): void {
+  switch (msg.op) {
+    case "get_state":
+      return send({ ev: "state", state: engine.snapshot() });
+    case "get_catalog":
+      return send({ ev: "catalog", descriptors: listDescriptors() });
+    case "load_pipeline":
+      engine.load(msg.spec);
+      return;
+    case "run":
+      if (!engine.running) {
+        engine.run().catch((err) =>
+          broker.broadcast({ ev: "error", message: err instanceof Error ? err.message : String(err) })
+        );
       }
-    } catch (err) {
-      send({ ev: "error", message: err instanceof Error ? err.message : String(err) });
+      return;
+    case "stop":
+      return engine.stop();
+    case "pause_training":
+      return engine.pause();
+    case "resume_training":
+      return engine.resume();
+    case "cancel_training":
+      return engine.stop(); // abort + wake paused nodes; trainer frees GPU ctx
+    case "commit_training":
+      return engine.commitEarly(); // freeze weights/moments, node ends 'done'
+    case "update_params":
+      return engine.updateNodeParams(msg.nodeId, msg.params);
+    case "move_node":
+      return engine.updateNodePosition(msg.nodeId, msg.position);
+    case "add_node":
+      return engine.addNode(msg.node);
+    case "remove_node":
+      return engine.removeNode(msg.nodeId);
+    case "add_edge":
+      return engine.addEdge(msg.edge);
+    case "remove_edge":
+      return engine.removeEdge(msg.edge);
+    case "get_templates":
+      return send({ ev: "templates", templates: TEMPLATES });
+    case "apply_template": {
+      const tpl = TEMPLATES.find((t) => t.id === msg.templateId);
+      if (!tpl) throw new Error(`Unknown template: ${msg.templateId}`);
+      // Deep-copy so canvas edits never mutate the pristine template.
+      engine.load(JSON.parse(JSON.stringify(tpl.spec)));
+      return;
     }
-  });
+    case "library_list":
+      return send({ ev: "library", variants: library.list() });
+    case "library_create":
+      library.create(msg.name, msg.overrides ?? {});
+      return;
+    case "library_delete":
+      return library.delete(msg.variantId);
+    case "library_rename":
+      library.rename(msg.variantId, msg.name);
+      return;
+    case "library_clone":
+      library.clone(msg.sourceId, msg.name, msg.overrides ?? {});
+      return;
+    case "library_train":
+      library
+        .train(msg.variantId, { steps: msg.steps, batchSize: msg.batchSize, lr: msg.lr })
+        .catch((err) =>
+          send({ ev: "error", message: err instanceof Error ? err.message : String(err) })
+        );
+      return;
+    case "library_stop_train":
+      return library.stopTraining(msg.variantId);
+    case "chat_send":
+      void runChat(msg.chatId, msg.variantId, msg.prompt, msg.maxTokens ?? 96, msg.temperature ?? 0.8, msg.topP ?? 1);
+      return;
+    case "chat_stop":
+      chatAborts.get(msg.chatId)?.abort();
+      return;
+    case "mcp":
+      void mcp(msg.payload).then((payload) => send({ ev: "mcp_result", payload }));
+      return;
+    default:
+      return send({ ev: "error", message: `Unknown op` });
+  }
+}
 
-  ws.on("close", () => clients.delete(ws));
+const broker = new MessageBroker({
+  port: PORT,
+  onOp: handleOp,
+  restGet: {
+    state: () => engine.snapshot(),
+    catalog: () => listDescriptors(),
+    templates: () => TEMPLATES,
+    library: () => library.list(),
+    datasets: () => datasets.list(),
+  },
+  onUiConnect: (send) => {
+    send({ ev: "catalog", descriptors: listDescriptors() });
+    send({ ev: "templates", templates: TEMPLATES });
+    send({ ev: "state", state: engine.snapshot() });
+    send({ ev: "library", variants: library.list() });
+    send({ ev: "workers", workers: broker.listWorkers() });
+  },
 });
 
-console.log(`llmdev bridge listening on ws://localhost:${PORT}`);
+// Engine events → all UI clients.
+engine.on("state", (state) => broker.broadcast({ ev: "state", state }));
+engine.on("metric", (metric) => broker.broadcast({ ev: "metric", metric }));
+engine.on("log", ({ nodeId, message }) => {
+  console.log(`[${nodeId}] ${message}`);
+  broker.broadcast({ ev: "log", nodeId, message });
+});
+
+// Library events → all UI clients (variant list changes + live benchmarks).
+library.on("library", (variants) => broker.broadcast({ ev: "library", variants }));
+library.on("metric", (metric) => broker.broadcast({ ev: "variant_metric", metric }));
+
+broker.listen();
+
+console.log(`llmdev coordinator listening on http+ws://localhost:${PORT}  (ws /  ·  ws /worker  ·  REST /api/*)`);
 console.log(
   cudaAvailable()
     ? `compute backend: CUDA — ${cudaDeviceName()}`

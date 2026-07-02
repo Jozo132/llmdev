@@ -128,7 +128,9 @@ export type ServerMessage =
   | { ev: "variant_metric"; metric: VariantMetric }
   | { ev: "chat_token"; chatId: string; token: number; text: string }
   | { ev: "chat_done"; chatId: string; reason: "complete" | "stopped" | "error"; message?: string }
-  | { ev: "mcp_result"; payload: unknown };
+  | { ev: "mcp_result"; payload: unknown }
+  | { ev: "workers"; workers: Array<{ id: string; capabilities: Record<string, unknown>; connectedAt: string }> }
+  | { ev: "worker_event"; workerId: string; payload: unknown };
 
 export type ClientMessage =
   | { op: "get_state" }
@@ -139,6 +141,7 @@ export type ClientMessage =
   | { op: "pause_training" }
   | { op: "resume_training" }
   | { op: "cancel_training" }
+  | { op: "commit_training" }
   | { op: "update_params"; nodeId: string; params: Record<string, unknown> }
   | { op: "move_node"; nodeId: string; position: { x: number; y: number } }
   | { op: "add_node"; node: NodeInstanceSpec }

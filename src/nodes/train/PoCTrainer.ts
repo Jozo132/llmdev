@@ -102,6 +102,8 @@ export class PoCTrainer implements PipelineNode {
     };
 
     let finalLoss = NaN;
+    let stepsCompleted = 0;
+    let committedEarly = false;
     try {
       for (let step = 1; step <= p.steps; step++) {
         // Pause gate: blocks between steps — weights + Adam moments stay
@@ -111,11 +113,20 @@ export class PoCTrainer implements PipelineNode {
           ctx.log(`Cancelled at step ${step} — releasing GPU context`);
           break;
         }
+        // "Commit Early / Proceed": checked between steps (i.e. between CUDA
+        // kernel launches — the device queue is empty here), so weights and
+        // both Adam moments freeze exactly as-is and the node returns 'done'.
+        if (ctx.shouldCommit()) {
+          committedEarly = true;
+          ctx.log(`Commit & Proceed at step ${step - 1}/${p.steps} — weights + Adam moments frozen, skipping remaining iterations`);
+          break;
+        }
         const batch = Array.from({ length: p.batchSize }, sampleWindow);
         const t0 = performance.now();
         const { loss, tokensProcessed } = model.step(batch, p.lr);
         const dt = (performance.now() - t0) / 1000;
         finalLoss = loss;
+        stepsCompleted = step;
 
         if (step % p.logEvery === 0 || step === p.steps) {
           const tps = tokensProcessed / dt;
@@ -145,9 +156,13 @@ export class PoCTrainer implements PipelineNode {
       paramCount: model.paramCount,
       weights: model.params,
       finalLoss,
-      stepsCompleted: p.steps,
+      stepsCompleted,
     };
-    ctx.log(`Training done — final loss ${finalLoss.toFixed(4)}`);
+    ctx.log(
+      committedEarly
+        ? `Training committed early — ${stepsCompleted}/${p.steps} steps, final loss ${finalLoss.toFixed(4)}`
+        : `Training done — final loss ${finalLoss.toFixed(4)}`
+    );
     return { model: handle };
   }
 }

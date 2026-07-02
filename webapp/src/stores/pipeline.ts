@@ -12,6 +12,7 @@ import type {
 
 const WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${location.hostname}:8881`;
 const METRIC_HISTORY = 300;
+const ANALYTICS_HISTORY = 50_000; // non-truncated historic charts (safety cap)
 
 export interface ChatMessage {
   role: "user" | "assistant" | "tool";
@@ -27,8 +28,12 @@ export const usePipelineStore = defineStore("pipeline", {
     catalog: [] as NodeDescriptor[],
     templates: [] as ArchTemplate[],
     metrics: {} as Record<string, MetricEvent[]>, // keyed by metric name
+    history: {} as Record<string, MetricEvent[]>, // non-truncated analytics series
     nodeProgress: {} as Record<string, number>,   // nodeId → 0..1 live progress
     nodeTimes: {} as Record<string, number>,      // nodeId → execution_time_ms
+    nodeElapsed: {} as Record<string, number>,    // nodeId → elapsedTimeMs (live)
+    nodeEta: {} as Record<string, number>,        // nodeId → windowed etaMs
+    workers: [] as Array<{ id: string; capabilities: Record<string, unknown>; connectedAt: string }>,
     logs: [] as Array<{ nodeId: string; message: string }>,
     selectedNodeId: null as string | null,
     lastError: "" as string,
@@ -98,11 +103,23 @@ export const usePipelineStore = defineStore("pipeline", {
           }
           if (msg.metric.name === "execution_time_ms") {
             this.nodeTimes[msg.metric.nodeId] = msg.metric.value;
+            delete this.nodeEta[msg.metric.nodeId]; // node finished — clear ETA
+            break;
+          }
+          if (msg.metric.name === "elapsed_ms") {
+            this.nodeElapsed[msg.metric.nodeId] = msg.metric.value;
+            break;
+          }
+          if (msg.metric.name === "eta_ms") {
+            this.nodeEta[msg.metric.nodeId] = msg.metric.value;
             break;
           }
           const arr = (this.metrics[msg.metric.name] ??= []);
           arr.push(msg.metric);
           if (arr.length > METRIC_HISTORY) arr.shift();
+          const hist = (this.history[msg.metric.name] ??= []);
+          hist.push(msg.metric);
+          if (hist.length > ANALYTICS_HISTORY) hist.shift();
           break;
         }
         case "log":
@@ -149,6 +166,11 @@ export const usePipelineStore = defineStore("pipeline", {
           });
           break;
         }
+        case "workers":
+          this.workers = msg.workers;
+          break;
+        case "worker_event":
+          break; // reserved: remote-worker telemetry mirror
       }
     },
 
@@ -158,8 +180,11 @@ export const usePipelineStore = defineStore("pipeline", {
 
     run() {
       this.metrics = {};
+      this.history = {};
       this.nodeProgress = {};
       this.nodeTimes = {};
+      this.nodeElapsed = {};
+      this.nodeEta = {};
       this.send({ op: "run" });
     },
     stop() {
@@ -173,6 +198,10 @@ export const usePipelineStore = defineStore("pipeline", {
     },
     cancelTraining() {
       this.send({ op: "cancel_training" });
+    },
+    /** "Commit & Proceed": freeze weights/moments now, node completes as done. */
+    commitTraining() {
+      this.send({ op: "commit_training" });
     },
 
     // ── interactive graph editing (optimism deferred to the state broadcast —

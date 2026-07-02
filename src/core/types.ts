@@ -67,6 +67,13 @@ export interface NodeRunContext {
   /** Cooperative cancellation — long loops must poll this. */
   signal: AbortSignal;
   /**
+   * "Commit Early / Proceed" seam — when true, training loops must stop
+   * iterating IMMEDIATELY after the current step, keep weights + optimizer
+   * moments exactly as they are, and return normally so the node completes
+   * as 'done' and downstream nodes fire.
+   */
+  shouldCommit(): boolean;
+  /**
    * Cooperative pause gate — resolves immediately when not paused, otherwise
    * blocks until resume/cancel. Weight & optimizer state stay untouched in
    * host/device memory while suspended.

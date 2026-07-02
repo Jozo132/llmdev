@@ -65,6 +65,24 @@ const execTime = computed(() => {
   return t < 1000 ? `${t.toFixed(0)}ms` : `${(t / 1000).toFixed(1)}s`;
 });
 
+const fmtClock = (ms: number): string => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const mm = `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+  return h > 0 ? `${h}:${mm}` : mm;
+};
+
+/** "[⏳ 01:23 / 04:15 Remaining]" — windowed velocity ETA from the engine. */
+const etaLabel = computed(() => {
+  if (props.node.status !== "running") return null;
+  const elapsed = store.nodeElapsed[props.node.id];
+  if (elapsed == null) return null;
+  const eta = store.nodeEta[props.node.id];
+  return eta != null
+    ? `[⏳ ${fmtClock(elapsed)} / ${fmtClock(eta)} Remaining]`
+    : `[⏳ ${fmtClock(elapsed)}]`;
+});
+
 const STATUS_BADGE: Record<string, { text: string; cls: string }> = {
   idle: { text: "idle", cls: "fill-slate-500" },
   running: { text: "running…", cls: "fill-amber-400" },
@@ -123,6 +141,13 @@ const acceptsPending = (p: PortSpec) =>
       <rect x="16" y="64" :width="NODE_W - 32" height="4" rx="2" class="fill-slate-700" />
       <rect x="16" y="64" :width="Math.max(2, (NODE_W - 32) * Math.min(1, progress))" height="4" rx="2" :fill="accent" />
     </g>
+
+    <!-- elapsed / windowed-velocity ETA readout next to the status indicator -->
+    <text
+      v-if="etaLabel"
+      :x="NODE_W / 2" :y="NODE_H + 14" text-anchor="middle"
+      class="fill-amber-300 text-[10px] font-mono"
+    >{{ etaLabel }}</text>
 
     <!-- input ports — pointerup completes a pending connection -->
     <circle

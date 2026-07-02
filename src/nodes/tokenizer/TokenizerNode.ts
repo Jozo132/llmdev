@@ -10,6 +10,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ByteBpeTokenizer } from "../../ml/tokenizer.js";
 import { trainBpeMerges } from "../../ml/bpeParallel.js";
+import { getDatasetDB, type ShardWriter } from "../../core/DatasetDB.js";
 import type {
   NodeDescriptor, NodeParams, NodeRunContext, PipelineNode, TokenFileRef,
 } from "../../core/types.js";
@@ -103,6 +104,30 @@ export class TokenizerNode implements PipelineNode {
       }
     } catch { /* corrupt cache manifest → retrain */ }
 
+    // ── SQLite warehouse hit: pre-tokenized shards shared across model shapes.
+    // The decode_map rides in the datasets row, so the tokenizer rehydrates
+    // with zero reprocessing and the .bin materializes straight from BLOBs.
+    const db = getDatasetDB(ctx.artifactsDir);
+    const stored = db.findByKey(cacheKey);
+    if (stored) {
+      const cached = ByteBpeTokenizer.fromJSON(
+        db.decodeMap(stored.id) as { merges: Array<[number, number]> }
+      );
+      const tokens = db.loadTokens(stored.id);
+      await writeFile(outPath, Buffer.from(tokens.buffer, tokens.byteOffset, tokens.byteLength));
+      await writeFile(tokPath, JSON.stringify(cached.toJSON()));
+      await writeFile(cachePath, JSON.stringify({
+        key: cacheKey, tokens: tokens.length, vocabSize: cached.vocabSize,
+        createdAt: new Date().toISOString(),
+      }));
+      ctx.metric("tokens_written", tokens.length);
+      ctx.metric("node_progress", 1);
+      ctx.log(`Warehouse hit (dataset #${stored.id}, ${cacheKey.slice(0, 12)}…) — ` +
+              `materialized ${tokens.length} pre-tokenized tokens from SQLite`);
+      const ref: TokenFileRef = { path: outPath, tokens: tokens.length, vocabSize: cached.vocabSize };
+      return { tokens: ref, tokenizer: cached };
+    }
+
     // Phase 1 — buffer a bounded sample and the docs it came from (RAM only).
     ctx.log(`Collecting ≤${p.trainSampleChars} chars to train BPE (vocab ${p.vocabSize})…`);
     ctx.metric("node_progress", 0.02);
@@ -136,9 +161,17 @@ export class TokenizerNode implements PipelineNode {
     const tokenizer = ByteBpeTokenizer.fromJSON({ merges });
     ctx.log(`BPE trained: vocab=${tokenizer.vocabSize} in ${((performance.now() - t0) / 1000).toFixed(1)}s (parallel pair counting)`);
 
-    // Phase 2 — encode buffered docs + remaining stream straight to .bin.
+    // Phase 2 — encode buffered docs + remaining stream straight to .bin,
+    // mirroring every chunk into the SQLite warehouse (batched transactions).
     const ws = createWriteStream(outPath);
     let written = 0;
+    const shardWriter: ShardWriter = db.createWriter({
+      key: cacheKey,
+      name: path.basename(p.outFile, ".bin"),
+      source: { sourceKey, vocabSize: p.vocabSize, maxTokens: p.maxTokens },
+      vocabSize: tokenizer.vocabSize,
+      decodeMap: tokenizer.toJSON(),
+    });
 
     const writeTokens = async (ids: Uint16Array): Promise<boolean> => {
       const room = p.maxTokens - written;
@@ -147,6 +180,7 @@ export class TokenizerNode implements PipelineNode {
       // uint16 little-endian, written incrementally — never a giant buffer.
       const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.length * 2);
       if (!ws.write(buf)) await new Promise<void>((r) => ws.once("drain", () => r()));
+      shardWriter.append(slice);
       written += slice.length;
       const now = performance.now();
       if (now - lastEmit > 100) {
@@ -181,13 +215,16 @@ export class TokenizerNode implements PipelineNode {
     // Persist tokenizer next to the shard for later decode/export.
     await writeFile(tokPath, JSON.stringify(tokenizer.toJSON()));
 
-    // Write the cache manifest ONLY on a complete run — a tiny .json, so the
-    // shard itself doubles as the cache (no duplicated bytes on disk).
+    // Write the cache manifest + commit the warehouse rows ONLY on a complete
+    // run — a cancelled run rolls the dataset back so no partial shards leak.
     if (!ctx.signal.aborted) {
+      shardWriter.commit();
       await writeFile(cachePath, JSON.stringify({
         key: cacheKey, tokens: written, vocabSize: tokenizer.vocabSize,
         createdAt: new Date().toISOString(),
       }));
+    } else {
+      shardWriter.abort();
     }
 
     ctx.metric("tokens_written", written);
