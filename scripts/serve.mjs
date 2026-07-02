@@ -2,7 +2,7 @@
 /**
  * serve.mjs — unified entrypoint for `npm run serve`.
  * Provisions (deps + optional native CUDA addon build), then boots:
- *   [engine] WebSocket backend with the node-tree executor  (ws://:8081)
+ *   [engine] WebSocket backend with the node-tree executor  (ws://:8881)
  *   [webapp] Vue 3 frontend — SVG canvas + Chat Sandbox     (http://:5173)
  * Both are supervised; Ctrl-C tears everything down.
  */
@@ -73,4 +73,4 @@ process.on("SIGTERM", () => shutdown(0));
 log("serve", `pipeline: ${PIPELINE}`);
 boot("engine", "npx", ["tsx", "src/server/index.ts", PIPELINE]);
 boot("webapp", "npm", ["--prefix", "webapp", "run", "dev"]);
-log("serve", "canvas + chat → http://localhost:5173   bridge → ws://localhost:8081");
+log("serve", "canvas + chat → http://localhost:5173   bridge → ws://localhost:8881");

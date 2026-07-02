@@ -16,16 +16,32 @@ const DESCRIPTOR: NodeDescriptor = {
   type: "tokenizer.byteBpe",
   label: "Byte-BPE Tokenizer",
   category: "tokenizer",
+  theory:
+    "Byte-Pair Encoding: start from raw bytes (256 symbols, zero OOV) and " +
+    "greedily merge the most frequent adjacent pair until the vocab target. " +
+    "Compression ratio directly multiplies effective context: 3.5 chars/token " +
+    "means a 2048-token window sees ~7KB of code. Output is packed uint16 " +
+    "(2 bytes/token) — the .bin shard IS the training set.",
   inputs: [{ name: "text", dataType: "text-stream", required: true }],
   outputs: [
     { name: "tokens", dataType: "token-file" },
     { name: "tokenizer", dataType: "tokenizer" },
   ],
   paramSchema: [
-    { key: "vocabSize", label: "Vocab size", type: "number", default: 8192 },
-    { key: "trainSampleChars", label: "BPE train sample (chars)", type: "number", default: 400_000 },
+    { key: "vocabSize", label: "Vocab size", type: "number", default: 8192,
+      theory: "Bigger vocab ⇒ better compression but V·d embedding params grow " +
+        "linearly — at small d the embedding dominates the whole model. " +
+        "uint16 packing caps V at 65535.",
+      range: "4096–32768 for ≤10M-param models" },
+    { key: "trainSampleChars", label: "BPE train sample (chars)", type: "number", default: 400_000,
+      theory: "Merges are learned from this in-RAM sample only. Larger = more " +
+        "representative merges but BPE training is O(vocab × sample).",
+      range: "100K–2M chars" },
     { key: "maxTokens", label: "Token budget (shard cap)", type: "number", default: 2_000_000,
-      description: "Hard cap on emitted tokens — 2M tokens = 4MB on disk" },
+      description: "Hard cap on emitted tokens — 2M tokens = 4MB on disk",
+      theory: "Disk-budget guardrail: tokens × 2 bytes on disk. Also bounds an " +
+        "epoch: steps × batch × ctx tokens sampled per run.",
+      range: "≤ 50M under the 100GB plan" },
     { key: "outFile", label: "Output shard", type: "string", default: "tokens/js-poc.bin" },
   ],
 };

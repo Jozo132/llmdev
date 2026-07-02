@@ -37,7 +37,7 @@ llmdev/
 │   │   └── export/ExportNode.ts         # JSON header + fp32 .weights.bin (~4MB)
 │   └── server/
 │       ├── protocol.ts          # typed WS wire protocol (shared contract)
-│       └── index.ts             # WebSocket bridge on :8081
+│       └── index.ts             # WebSocket bridge on :8881
 └── webapp/                      # ── Vue 3 + TS + Tailwind ──
     └── src/
         ├── stores/pipeline.ts   # Pinia store ↔ WS mirror of the engine

@@ -15,10 +15,12 @@ int llm_cuda_available();
 int llm_device_name(char* buf, int len);
 void* llm_ctx_create(const float* E, int V, int d);
 void llm_ctx_destroy(void* ctx);
+void llm_ctx_release_buffers(void* ctx);
 void llm_ctx_sync_e(void* ctx, const float* E);
 void llm_ctx_logits_forward(void* ctx, const float* y, float* logits);
 void llm_ctx_logits_backward(void* ctx, const float* y, const float* dLogits, float* dY);
 void llm_ctx_flush_grad_e(void* ctx, float* gE);
+int llm_attn_last_forward(const float* x, int T, int d, float* out);
 void llm_sgemm(const float* A, const float* B, float* C, int M, int K, int N);
 }
 
@@ -72,6 +74,22 @@ Napi::Value FlushGradE(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// releaseContext(ctx) — immediate device-buffer free for cancel_training.
+// Safe to call repeatedly; the GC finalizer later reclaims the host struct.
+Napi::Value ReleaseContext(const Napi::CallbackInfo& info) {
+  llm_ctx_release_buffers(info[0].As<Napi::External<void>>().Data());
+  return info.Env().Undefined();
+}
+
+// attnLastForward(x[T*d], T, d, out[T*d]) → bool (false = use CPU fallback)
+Napi::Value AttnLastForward(const Napi::CallbackInfo& info) {
+  int ok = llm_attn_last_forward(F32(info[0]),
+                                 info[1].As<Napi::Number>().Int32Value(),
+                                 info[2].As<Napi::Number>().Int32Value(),
+                                 F32(info[3]));
+  return Napi::Boolean::New(info.Env(), ok == 1);
+}
+
 // sgemm(A[M*K], B[K*N], C[M*N], M, K, N) — generic building block.
 Napi::Value Sgemm(const Napi::CallbackInfo& info) {
   llm_sgemm(F32(info[0]), F32(info[1]), F32(info[2]),
@@ -85,10 +103,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("cudaAvailable", Napi::Function::New(env, CudaAvailable));
   exports.Set("deviceName", Napi::Function::New(env, DeviceName));
   exports.Set("createContext", Napi::Function::New(env, CreateContext));
+  exports.Set("releaseContext", Napi::Function::New(env, ReleaseContext));
   exports.Set("syncE", Napi::Function::New(env, SyncE));
   exports.Set("logitsForward", Napi::Function::New(env, LogitsForward));
   exports.Set("logitsBackward", Napi::Function::New(env, LogitsBackward));
   exports.Set("flushGradE", Napi::Function::New(env, FlushGradE));
+  exports.Set("attnLastForward", Napi::Function::New(env, AttnLastForward));
   exports.Set("sgemm", Napi::Function::New(env, Sgemm));
   return exports;
 }

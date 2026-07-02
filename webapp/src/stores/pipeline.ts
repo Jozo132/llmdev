@@ -6,11 +6,11 @@
  */
 import { defineStore } from "pinia";
 import type {
-  ClientMessage, MetricEvent, ModelVariant, NodeDescriptor, PipelineStateSnapshot,
-  ServerMessage, VariantMetric,
+  ArchTemplate, ClientMessage, EdgeSpec, MetricEvent, ModelVariant, NodeDescriptor,
+  NodeInstanceSpec, PipelineStateSnapshot, ServerMessage, VariantMetric,
 } from "../types";
 
-const WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${location.hostname}:8081`;
+const WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${location.hostname}:8881`;
 const METRIC_HISTORY = 300;
 
 export interface ChatMessage {
@@ -25,6 +25,7 @@ export const usePipelineStore = defineStore("pipeline", {
     connected: false,
     state: null as PipelineStateSnapshot | null,
     catalog: [] as NodeDescriptor[],
+    templates: [] as ArchTemplate[],
     metrics: {} as Record<string, MetricEvent[]>, // keyed by metric name
     logs: [] as Array<{ nodeId: string; message: string }>,
     selectedNodeId: null as string | null,
@@ -37,6 +38,7 @@ export const usePipelineStore = defineStore("pipeline", {
     activeChatId: null as string | null,
     chatVariantId: null as string | null,
     mcpLog: [] as unknown[],
+    mcpTools: [] as Array<{ name: string; description: string }>,
     _ws: null as WebSocket | null,
   }),
 
@@ -75,6 +77,9 @@ export const usePipelineStore = defineStore("pipeline", {
           break;
         case "catalog":
           this.catalog = msg.descriptors;
+          break;
+        case "templates":
+          this.templates = msg.templates;
           break;
         case "metric": {
           const arr = (this.metrics[msg.metric.name] ??= []);
@@ -115,13 +120,17 @@ export const usePipelineStore = defineStore("pipeline", {
           this.activeChatId = null;
           break;
         }
-        case "mcp_result":
+        case "mcp_result": {
           this.mcpLog.push(msg.payload);
+          // Keep the tool catalog fresh when a tools/list result arrives.
+          const result = (msg.payload as { result?: { tools?: Array<{ name: string; description: string }> } })?.result;
+          if (result?.tools) this.mcpTools = result.tools;
           this.chatMessages.push({
             role: "tool",
             text: JSON.stringify(msg.payload, null, 2),
           });
           break;
+        }
       }
     },
 
@@ -135,6 +144,36 @@ export const usePipelineStore = defineStore("pipeline", {
     },
     stop() {
       this.send({ op: "stop" });
+    },
+    pauseTraining() {
+      this.send({ op: "pause_training" });
+    },
+    resumeTraining() {
+      this.send({ op: "resume_training" });
+    },
+    cancelTraining() {
+      this.send({ op: "cancel_training" });
+    },
+
+    // ── interactive graph editing (optimism deferred to the state broadcast —
+    //    the engine validates types/cycles and is the source of truth) ──
+    addNode(node: NodeInstanceSpec) {
+      this.send({ op: "add_node", node });
+    },
+    removeNode(nodeId: string) {
+      if (this.selectedNodeId === nodeId) this.selectedNodeId = null;
+      this.send({ op: "remove_node", nodeId });
+    },
+    addEdge(edge: EdgeSpec) {
+      this.send({ op: "add_edge", edge });
+    },
+    removeEdge(edge: EdgeSpec) {
+      this.send({ op: "remove_edge", edge });
+    },
+    applyTemplate(templateId: string) {
+      this.metrics = {};
+      this.selectedNodeId = null;
+      this.send({ op: "apply_template", templateId });
     },
 
     updateParams(nodeId: string, params: Record<string, unknown>) {
@@ -163,7 +202,7 @@ export const usePipelineStore = defineStore("pipeline", {
     },
 
     // ── chat sandbox ──
-    sendChat(prompt: string, maxTokens = 96, temperature = 0.8) {
+    sendChat(prompt: string, maxTokens = 96, temperature = 0.8, topP = 1) {
       if (!this.chatVariantId || this.activeChatId) return;
       const chatId = crypto.randomUUID();
       this.activeChatId = chatId;
@@ -172,7 +211,7 @@ export const usePipelineStore = defineStore("pipeline", {
         role: "assistant", text: "", streaming: true, variantId: this.chatVariantId,
       });
       this.send({
-        op: "chat_send", chatId, variantId: this.chatVariantId, prompt, maxTokens, temperature,
+        op: "chat_send", chatId, variantId: this.chatVariantId, prompt, maxTokens, temperature, topP,
       });
     },
     stopChat() {

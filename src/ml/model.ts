@@ -69,6 +69,29 @@ export class TinyLM {
     return this.params.length;
   }
 
+  /**
+   * Named-tensor layout of the flat parameter buffer — the serialization
+   * contract used by the GGUF / safetensors exporters (src/core/Exporters.ts).
+   * Offsets are element (not byte) offsets; shapes are row-major.
+   */
+  static tensorLayout(cfg: ModelConfig): Array<{ name: string; offset: number; shape: number[] }> {
+    const { vocabSize: V, dModel: d, contextLength: ctx, hiddenDim: h } = cfg;
+    let o = 0;
+    const t = (name: string, shape: number[]) => {
+      const entry = { name, offset: o, shape };
+      o += shape.reduce((a, b) => a * b, 1);
+      return entry;
+    };
+    return [
+      t("token_embd.weight", [V, d]),   // tied output head reads this too
+      t("pos_embd.weight", [ctx, d]),
+      t("ffn_up.weight", [d, h]),
+      t("ffn_up.bias", [h]),
+      t("ffn_down.weight", [h, d]),
+      t("ffn_down.bias", [d]),
+    ];
+  }
+
   private initWeights(): void {
     // Small deterministic-ish gaussian init (Box–Muller).
     const scale = 0.02;
@@ -234,8 +257,10 @@ export class TinyLM {
   /**
    * Predict the next token for a context (public inference API used by the
    * Chat Sandbox). temperature 0 ⇒ greedy argmax; >0 ⇒ softmax sampling.
+   * topP < 1 restricts sampling to the smallest set of tokens whose
+   * cumulative probability ≥ topP (nucleus sampling — cuts the long tail).
    */
-  nextToken(contextIds: ArrayLike<number>, temperature = 0): number {
+  nextToken(contextIds: ArrayLike<number>, temperature = 0, topP = 1): number {
     const logits = this.logitsFor(contextIds);
     const V = logits.length;
     if (temperature <= 0) {
@@ -251,7 +276,26 @@ export class TinyLM {
       probs[i] = Math.exp((logits[i] - max) / temperature);
       sum += probs[i];
     }
-    let r = Math.random() * sum;
+    for (let i = 0; i < V; i++) probs[i] /= sum;
+
+    if (topP < 1) {
+      // Nucleus: keep highest-prob tokens until cumulative ≥ topP.
+      const order = Array.from({ length: V }, (_, i) => i).sort((a, b) => probs[b] - probs[a]);
+      let cum = 0;
+      let cut = V;
+      for (let r = 0; r < V; r++) {
+        cum += probs[order[r]];
+        if (cum >= topP) { cut = r + 1; break; }
+      }
+      let r = Math.random() * cum;
+      for (let i = 0; i < cut; i++) {
+        r -= probs[order[i]];
+        if (r <= 0) return order[i];
+      }
+      return order[cut - 1];
+    }
+
+    let r = Math.random();
     for (let i = 0; i < V; i++) {
       r -= probs[i];
       if (r <= 0) return i;

@@ -248,6 +248,7 @@ export class LibraryManager extends EventEmitter {
       variant.finalLoss = finalLoss;
       variant.history = variant.history.slice(-200); // bounded benchmark history
       writeFileSync(path.join(dir, "model.json"), JSON.stringify({ ...variant, training: false }, null, 2));
+      model.backend.dispose(); // release device buffers promptly
     } finally {
       this.trainingIds.delete(variantId);
       this.aborts.delete(variantId);

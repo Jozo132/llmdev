@@ -22,15 +22,34 @@ const DESCRIPTOR: NodeDescriptor = {
   type: "train.poc",
   label: "PoC Trainer (1M params)",
   category: "train",
+  theory:
+    "Minimal-but-real training loop: sample random context windows, forward " +
+    "pass, softmax cross-entropy, exact hand-derived backward, Adam update. " +
+    "Adam keeps two moments per parameter (m̂ momentum, v̂ curvature) ⇒ " +
+    "optimizer state = 2× model size in RAM/VRAM — why big-model training " +
+    "costs ≈3× weights. Pause blocks between steps preserving both moments; " +
+    "cancel frees the CUDA context immediately.",
   inputs: [
     { name: "config", dataType: "model-config", required: true },
     { name: "tokens", dataType: "token-file", required: true },
   ],
   outputs: [{ name: "model", dataType: "model" }],
   paramSchema: [
-    { key: "steps", label: "Training steps", type: "number", default: 30 },
-    { key: "batchSize", label: "Batch size", type: "number", default: 4 },
-    { key: "lr", label: "Learning rate", type: "number", default: 0.003 },
+    { key: "steps", label: "Training steps", type: "number", default: 30,
+      theory: "Each step = one gradient update on batchSize windows. Loss " +
+        "should fall from ln(V) (uniform prediction) within tens of steps.",
+      range: "10–100 PoC · thousands for real runs" },
+    { key: "batchSize", label: "Batch size", type: "number", default: 4,
+      theory: "Windows averaged per update. Larger batch ⇒ lower gradient " +
+        "variance ⇒ supports higher lr (linear-scaling heuristic), but memory " +
+        "and step time grow linearly.",
+      range: "2–32 on this hardware" },
+    { key: "lr", label: "Learning rate", type: "number", default: 0.003,
+      theory: "Adam step scale: Δw = lr·m̂/(√v̂+ε). Too high ⇒ loss spikes/NaN " +
+        "(update overshoots curvature); too low ⇒ wasted compute. Rule of " +
+        "thumb: peak lr ≈ 3e-4 to 3e-3 for Adam at small scale, decayed over " +
+        "training.",
+      range: "1e-4 – 5e-3 (Adam)" },
     { key: "logEvery", label: "Log every N steps", type: "number", default: 1 },
   ],
 };
@@ -83,32 +102,41 @@ export class PoCTrainer implements PipelineNode {
     };
 
     let finalLoss = NaN;
-    for (let step = 1; step <= p.steps; step++) {
-      if (ctx.signal.aborted) {
-        ctx.log(`Aborted at step ${step}`);
-        break;
-      }
-      const batch = Array.from({ length: p.batchSize }, sampleWindow);
-      const t0 = performance.now();
-      const { loss, tokensProcessed } = model.step(batch, p.lr);
-      const dt = (performance.now() - t0) / 1000;
-      finalLoss = loss;
+    try {
+      for (let step = 1; step <= p.steps; step++) {
+        // Pause gate: blocks between steps — weights + Adam moments stay
+        // resident in host/device memory until resume or cancel.
+        await ctx.waitIfPaused();
+        if (ctx.signal.aborted) {
+          ctx.log(`Cancelled at step ${step} — releasing GPU context`);
+          break;
+        }
+        const batch = Array.from({ length: p.batchSize }, sampleWindow);
+        const t0 = performance.now();
+        const { loss, tokensProcessed } = model.step(batch, p.lr);
+        const dt = (performance.now() - t0) / 1000;
+        finalLoss = loss;
 
-      if (step % p.logEvery === 0 || step === p.steps) {
-        const tps = tokensProcessed / dt;
-        const vram = await sampleVramMb();
-        const rssMb = process.memoryUsage().rss / 1024 / 1024;
-        ctx.metric("loss", loss, { step });
-        ctx.metric("tokens_per_sec", tps, { step });
-        ctx.metric("vram_mb", vram, { step });
-        ctx.metric("rss_mb", rssMb, { step });
-        ctx.log(
-          `step ${step}/${p.steps}  loss=${loss.toFixed(4)}  ` +
-          `${tps.toFixed(0)} tok/s  vram=${vram}MB  rss=${rssMb.toFixed(0)}MB`
-        );
+        if (step % p.logEvery === 0 || step === p.steps) {
+          const tps = tokensProcessed / dt;
+          const vram = await sampleVramMb();
+          const rssMb = process.memoryUsage().rss / 1024 / 1024;
+          ctx.metric("loss", loss, { step });
+          ctx.metric("tokens_per_sec", tps, { step });
+          ctx.metric("vram_mb", vram, { step });
+          ctx.metric("rss_mb", rssMb, { step });
+          ctx.log(
+            `step ${step}/${p.steps}  loss=${loss.toFixed(4)}  ` +
+            `${tps.toFixed(0)} tok/s  vram=${vram}MB  rss=${rssMb.toFixed(0)}MB`
+          );
+        }
+        // Yield to the event loop so WebSocket frames flush between steps.
+        await new Promise((r) => setImmediate(r));
       }
-      // Yield to the event loop so WebSocket frames flush between steps.
-      await new Promise((r) => setImmediate(r));
+    } finally {
+      // Weights already live in the host Float32Array; the device-side
+      // embedding/grad buffers can be released immediately (idempotent).
+      model.backend.dispose();
     }
 
     const handle: TrainedModelHandle = {

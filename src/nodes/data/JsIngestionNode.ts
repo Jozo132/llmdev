@@ -15,6 +15,12 @@ const DESCRIPTOR: NodeDescriptor = {
   type: "data.jsIngestion",
   label: "JS Dataset Streamer (HF)",
   category: "data",
+  theory:
+    "Data quality upper-bounds model quality. This node streams documents " +
+    "page-by-page from the Hugging Face rows API — backpressure-driven, so " +
+    "nothing raw ever touches disk (100GB budget). Dataset scale intuition: " +
+    "Chinchilla-optimal training wants ≈20 tokens per parameter, so a 10M " +
+    "model wants ~200M tokens; PoC runs use far less and simply undertrain.",
   inputs: [],
   outputs: [{ name: "text", dataType: "text-stream" }],
   paramSchema: [
@@ -23,9 +29,16 @@ const DESCRIPTOR: NodeDescriptor = {
       description: "e.g. JavaScript-mit for github-code-clean, javascript for starcoderdata" },
     { key: "split", label: "Split", type: "string", default: "train" },
     { key: "contentField", label: "Text field", type: "string", default: "code" },
-    { key: "maxDocs", label: "Max documents", type: "number", default: 500 },
-    { key: "maxDocChars", label: "Max chars/doc", type: "number", default: 20000 },
-    { key: "pageSize", label: "Rows per request", type: "number", default: 100 },
+    { key: "maxDocs", label: "Max documents", type: "number", default: 500,
+      theory: "Hard cap on streamed documents — the disk/compute budget knob. " +
+        "More docs ⇒ more unique tokens ⇒ less memorization per epoch.",
+      range: "100–10000 for PoC scale" },
+    { key: "maxDocChars", label: "Max chars/doc", type: "number", default: 20000,
+      theory: "Truncates pathological files; keeps the token distribution from " +
+        "being dominated by single giant bundles.",
+      range: "5000–100000" },
+    { key: "pageSize", label: "Rows per request", type: "number", default: 100,
+      range: "1–100 (API hard limit)" },
   ],
 };
 

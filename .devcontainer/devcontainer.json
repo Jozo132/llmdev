@@ -45,9 +45,9 @@
     "source=llmdev-webapp-node-modules,target=${containerWorkspaceFolder}/webapp/node_modules,type=volume"
   ],
 
-  "forwardPorts": [8081, 5173],
+  "forwardPorts": [8881, 5173],
   "portsAttributes": {
-    "8081": { "label": "Pipeline WebSocket bridge" },
+    "8881": { "label": "Pipeline WebSocket bridge" },
     "5173": { "label": "Vue 3 webapp (Vite)" }
   },
 

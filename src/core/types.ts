@@ -36,6 +36,10 @@ export interface ParamSchemaEntry {
   options?: string[];       // for "select"
   default?: unknown;
   description?: string;
+  /** Inline theory: what the parameter does mathematically (gradients, VRAM…). */
+  theory?: string;
+  /** Strict safe/reasonable operating range shown in the UI. */
+  range?: string;
 }
 
 /** Static, serializable description of a node class (used by UI + registry). */
@@ -47,6 +51,8 @@ export interface NodeDescriptor {
   inputs: PortSpec[];
   outputs: PortSpec[];
   paramSchema: ParamSchemaEntry[];
+  /** Verbose architectural/mathematical theory for the help tooltip. */
+  theory?: string;
 }
 
 export type NodeStatus = "idle" | "running" | "done" | "error" | "skipped";
@@ -60,6 +66,12 @@ export interface NodeRunContext {
   log(message: string): void;
   /** Cooperative cancellation — long loops must poll this. */
   signal: AbortSignal;
+  /**
+   * Cooperative pause gate — resolves immediately when not paused, otherwise
+   * blocks until resume/cancel. Weight & optimizer state stay untouched in
+   * host/device memory while suspended.
+   */
+  waitIfPaused(): Promise<void>;
 }
 
 /**
@@ -130,6 +142,13 @@ export interface ModelConfig {
   mixer: string;
   /** Injection point: name of a registered loss function. */
   loss: string;
+  // ── Architectural design fields (drive the parameter calculator & future
+  //    projection-based blocks; the single-block PoC trainer records them) ──
+  nLayers?: number;
+  nHeads?: number;
+  /** KV heads for Grouped-Query Attention (kvHeads < nHeads ⇒ GQA). */
+  kvHeads?: number;
+  mlp?: "standard" | "swiglu";
 }
 
 export interface TrainedModelHandle {
@@ -168,6 +187,7 @@ export interface NodeStateSnapshot {
 export interface PipelineStateSnapshot {
   name: string;
   running: boolean;
+  paused: boolean;
   nodes: NodeStateSnapshot[];
   edges: EdgeSpec[];
 }

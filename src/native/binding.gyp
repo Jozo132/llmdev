@@ -28,12 +28,13 @@
             "nvcc",
             "-c", "<(RULE_INPUT_PATH)",
             "-o", "<(INTERMEDIATE_DIR)/<(RULE_INPUT_ROOT).o",
+            "-I/usr/local/cuda/include",
             "-O3",
             "--use_fast_math",
             "-std=c++17",
             "-Xcompiler", "-fPIC",
-            "-gencode", "arch=compute_120,code=sm_120",
-            "-gencode", "arch=compute_120,code=compute_120"
+            "-gencode", "arch=compute_89,code=sm_89",
+            "-gencode", "arch=compute_90,code=sm_90"
           ]
         }
       ]

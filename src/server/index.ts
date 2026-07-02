@@ -2,7 +2,7 @@
  * WebSocket bridge — serializes the live node-tree, streams training metrics
  * (loss, tokens/sec, VRAM), and accepts execution/edit commands from clients.
  *
- *   npm run server            → ws://localhost:8081
+ *   npm run server            → ws://localhost:8881
  *
  * The same Engine instance backs both this server and the CLI, so a pipeline
  * started headlessly is mirrored on every connected canvas in real time.
@@ -13,12 +13,13 @@ import "../nodes/index.js"; // register built-in node types
 import { Engine } from "../core/Engine.js";
 import { LibraryManager } from "../core/LibraryManager.js";
 import { listDescriptors } from "../core/Registry.js";
+import { TEMPLATES } from "../core/templates.js";
 import { cudaAvailable, cudaDeviceName } from "../ml/backend.js";
 import type { PipelineSpec } from "../core/types.js";
 import { createMcpHandler } from "./mcp.js";
 import type { ClientMessage, ServerMessage } from "./protocol.js";
 
-const PORT = Number(process.env.LLMDEV_WS_PORT ?? 8081);
+const PORT = Number(process.env.LLMDEV_WS_PORT ?? 8881);
 const engine = new Engine();
 const library = new LibraryManager(engine.artifactsDir);
 const mcp = createMcpHandler(library);
@@ -58,7 +59,7 @@ library.on("metric", (metric) => broadcast({ ev: "variant_metric", metric }));
 // ── Token-by-token local chat inference ──────────────────────────────
 async function runChat(
   chatId: string, variantId: string, prompt: string,
-  maxTokens: number, temperature: number
+  maxTokens: number, temperature: number, topP: number
 ): Promise<void> {
   const abort = new AbortController();
   chatAborts.set(chatId, abort);
@@ -70,7 +71,7 @@ async function runChat(
         broadcast({ ev: "chat_done", chatId, reason: "stopped" });
         return;
       }
-      const token = model.nextToken(ids, temperature);
+      const token = model.nextToken(ids, temperature, topP);
       ids.push(token);
       broadcast({ ev: "chat_token", chatId, token, text: tokenizer.decode([token]) });
       await new Promise((r) => setImmediate(r)); // stream frames between tokens
@@ -91,6 +92,7 @@ wss.on("connection", (ws) => {
   const send = (msg: ServerMessage) => ws.send(JSON.stringify(msg));
   // Sync new clients immediately.
   send({ ev: "catalog", descriptors: listDescriptors() });
+  send({ ev: "templates", templates: TEMPLATES });
   send({ ev: "state", state: engine.snapshot() });
   send({ ev: "library", variants: library.list() });
 
@@ -119,10 +121,33 @@ wss.on("connection", (ws) => {
           return;
         case "stop":
           return engine.stop();
+        case "pause_training":
+          return engine.pause();
+        case "resume_training":
+          return engine.resume();
+        case "cancel_training":
+          return engine.stop(); // abort + wake paused nodes; trainer frees GPU ctx
         case "update_params":
           return engine.updateNodeParams(msg.nodeId, msg.params);
         case "move_node":
           return engine.updateNodePosition(msg.nodeId, msg.position);
+        case "add_node":
+          return engine.addNode(msg.node);
+        case "remove_node":
+          return engine.removeNode(msg.nodeId);
+        case "add_edge":
+          return engine.addEdge(msg.edge);
+        case "remove_edge":
+          return engine.removeEdge(msg.edge);
+        case "get_templates":
+          return send({ ev: "templates", templates: TEMPLATES });
+        case "apply_template": {
+          const tpl = TEMPLATES.find((t) => t.id === msg.templateId);
+          if (!tpl) throw new Error(`Unknown template: ${msg.templateId}`);
+          // Deep-copy so canvas edits never mutate the pristine template.
+          engine.load(JSON.parse(JSON.stringify(tpl.spec)));
+          return;
+        }
         case "library_list":
           return send({ ev: "library", variants: library.list() });
         case "library_clone":
@@ -138,7 +163,7 @@ wss.on("connection", (ws) => {
         case "library_stop_train":
           return library.stopTraining(msg.variantId);
         case "chat_send":
-          void runChat(msg.chatId, msg.variantId, msg.prompt, msg.maxTokens ?? 96, msg.temperature ?? 0.8);
+          void runChat(msg.chatId, msg.variantId, msg.prompt, msg.maxTokens ?? 96, msg.temperature ?? 0.8, msg.topP ?? 1);
           return;
         case "chat_stop":
           chatAborts.get(msg.chatId)?.abort();

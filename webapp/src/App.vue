@@ -51,16 +51,36 @@ onMounted(() => store.connect());
           ▶ Run pipeline
         </button>
         <button
+          v-if="store.state?.running && !store.state?.paused"
+          class="rounded bg-amber-700 px-3 py-1 text-xs font-semibold hover:bg-amber-600"
+          title="Suspend between steps — weights & optimizer moments stay hot in memory"
+          @click="store.pauseTraining()"
+        >
+          ⏸ Pause
+        </button>
+        <button
+          v-if="store.state?.paused"
+          class="rounded bg-sky-700 px-3 py-1 text-xs font-semibold hover:bg-sky-600"
+          @click="store.resumeTraining()"
+        >
+          ⏵ Resume
+        </button>
+        <button
           class="rounded bg-red-800 px-3 py-1 text-xs font-semibold hover:bg-red-700 disabled:opacity-40"
           :disabled="!store.state?.running"
-          @click="store.stop()"
+          title="Abort the run and release the GPU context"
+          @click="store.cancelTraining()"
         >
-          ■ Stop
+          ■ Cancel
         </button>
+        <span
+          v-if="store.state?.paused"
+          class="rounded-full bg-amber-950 px-2 py-1 text-xs text-amber-300"
+        >paused — state preserved</span>
       </div>
     </header>
 
-    <MetricsBar />
+    <MetricsBar v-show="tab === 'canvas'" />
 
     <!-- Canvas tab: library | SVG playground | properties -->
     <main v-show="tab === 'canvas'" class="flex min-h-0 flex-1">
@@ -69,9 +89,8 @@ onMounted(() => store.connect());
       <PropertyPanel class="w-80 shrink-0 border-l border-slate-800 bg-panel" />
     </main>
 
-    <!-- Chat tab: library | conversational sandbox -->
+    <!-- Chat tab: immersive widescreen — canvas & config panels hidden -->
     <main v-show="tab === 'chat'" class="flex min-h-0 flex-1">
-      <WorkspacePanel class="w-72 shrink-0" />
       <ChatSandbox />
     </main>
 

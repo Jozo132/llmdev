@@ -13,6 +13,12 @@ const DESCRIPTOR: NodeDescriptor = {
   type: "eval.basic",
   label: "Evaluation",
   category: "eval",
+  theory:
+    "Held-out loss on fresh random windows the optimizer never stepped on. " +
+    "Perplexity = exp(loss) — the effective branching factor: ppl 500 means " +
+    "the model is as uncertain as choosing among 500 equally-likely tokens. " +
+    "Untrained baseline: ppl = vocab size. The greedy generation sample is a " +
+    "smoke test for mode collapse (repeating one token).",
   inputs: [
     { name: "model", dataType: "model", required: true },
     { name: "tokens", dataType: "token-file", required: true },
@@ -23,7 +29,9 @@ const DESCRIPTOR: NodeDescriptor = {
     { name: "model", dataType: "model" }, // pass-through for export
   ],
   paramSchema: [
-    { key: "evalBatches", label: "Eval batches", type: "number", default: 4 },
+    { key: "evalBatches", label: "Eval batches", type: "number", default: 4,
+      theory: "More batches ⇒ tighter loss estimate (stderr ∝ 1/√n).",
+      range: "4–32" },
     { key: "batchSize", label: "Batch size", type: "number", default: 4 },
     { key: "sampleTokens", label: "Sample gen tokens", type: "number", default: 24 },
   ],

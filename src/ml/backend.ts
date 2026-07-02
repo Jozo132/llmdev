@@ -82,10 +82,12 @@ interface NativeAddon {
   cudaAvailable(): boolean;
   deviceName(): string | null;
   createContext(E: Float32Array, V: number, d: number): unknown;
+  releaseContext(ctx: unknown): void;
   syncE(ctx: unknown, E: Float32Array): void;
   logitsForward(ctx: unknown, y: Float32Array, logits: Float32Array): void;
   logitsBackward(ctx: unknown, y: Float32Array, dLogits: Float32Array, dY: Float32Array): void;
   flushGradE(ctx: unknown, gE: Float32Array): void;
+  attnLastForward(x: Float32Array, T: number, d: number, out: Float32Array): boolean;
   sgemm(A: Float32Array, B: Float32Array, C: Float32Array, M: number, K: number, N: number): void;
 }
 
@@ -112,6 +114,22 @@ export function gpuSgemm(
 ): void {
   if (!cudaAvailable()) throw new Error("CUDA addon not available");
   addon!.sgemm(A, B, C, M, K, N);
+}
+
+/**
+ * Flash-attention hook for SoftmaxAttentionMixer: tiled KV-sliced online
+ * softmax on-device. Returns false (⇒ CPU streaming fallback) when the addon
+ * is missing or the model is too wide for the kernel's shared-memory budget.
+ */
+export function attnLastForwardGpu(
+  x: Float32Array, T: number, d: number, out: Float32Array
+): boolean {
+  if (!cudaAvailable()) return false;
+  try {
+    return addon!.attnLastForward(x, T, d, out);
+  } catch {
+    return false;
+  }
 }
 
 class CudaBackend implements ComputeBackend {
@@ -141,7 +159,10 @@ class CudaBackend implements ComputeBackend {
   }
 
   dispose(): void {
-    this.ctx = null; // finalizer frees device memory on GC
+    // Immediate device-memory release (cancel_training) — idempotent; the GC
+    // finalizer reclaims the remaining host-side struct later.
+    if (this.ctx) addon!.releaseContext(this.ctx);
+    this.ctx = null;
   }
 }
 

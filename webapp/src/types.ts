@@ -11,6 +11,10 @@ export interface ParamSchemaEntry {
   options?: string[];
   default?: unknown;
   description?: string;
+  /** Inline theory: what the parameter does mathematically. */
+  theory?: string;
+  /** Safe/reasonable operating range. */
+  range?: string;
 }
 
 export interface PortSpec {
@@ -26,6 +30,8 @@ export interface NodeDescriptor {
   inputs: PortSpec[];
   outputs: PortSpec[];
   paramSchema: ParamSchemaEntry[];
+  /** Verbose architectural/mathematical theory for the help tooltip. */
+  theory?: string;
 }
 
 export interface EdgeSpec {
@@ -46,8 +52,24 @@ export interface NodeStateSnapshot {
 export interface PipelineStateSnapshot {
   name: string;
   running: boolean;
+  paused: boolean;
   nodes: NodeStateSnapshot[];
   edges: EdgeSpec[];
+}
+
+export interface NodeInstanceSpec {
+  id: string;
+  type: string;
+  params?: Record<string, unknown>;
+  position?: { x: number; y: number };
+}
+
+export interface ArchTemplate {
+  id: string;
+  name: string;
+  description: string;
+  designParams: number;
+  spec: { name: string; nodes: NodeInstanceSpec[]; edges: EdgeSpec[] };
 }
 
 export interface MetricEvent {
@@ -98,6 +120,7 @@ export interface VariantMetric {
 export type ServerMessage =
   | { ev: "state"; state: PipelineStateSnapshot }
   | { ev: "catalog"; descriptors: NodeDescriptor[] }
+  | { ev: "templates"; templates: ArchTemplate[] }
   | { ev: "metric"; metric: MetricEvent }
   | { ev: "log"; nodeId: string; message: string }
   | { ev: "error"; message: string }
@@ -113,12 +136,21 @@ export type ClientMessage =
   | { op: "load_pipeline"; spec: { name: string; nodes: unknown[]; edges: EdgeSpec[] } }
   | { op: "run" }
   | { op: "stop" }
+  | { op: "pause_training" }
+  | { op: "resume_training" }
+  | { op: "cancel_training" }
   | { op: "update_params"; nodeId: string; params: Record<string, unknown> }
   | { op: "move_node"; nodeId: string; position: { x: number; y: number } }
+  | { op: "add_node"; node: NodeInstanceSpec }
+  | { op: "remove_node"; nodeId: string }
+  | { op: "add_edge"; edge: EdgeSpec }
+  | { op: "remove_edge"; edge: EdgeSpec }
+  | { op: "get_templates" }
+  | { op: "apply_template"; templateId: string }
   | { op: "library_list" }
   | { op: "library_clone"; sourceId: string; name: string; overrides?: Record<string, unknown> }
   | { op: "library_train"; variantId: string; steps?: number; batchSize?: number; lr?: number }
   | { op: "library_stop_train"; variantId: string }
-  | { op: "chat_send"; chatId: string; variantId: string; prompt: string; maxTokens?: number; temperature?: number }
+  | { op: "chat_send"; chatId: string; variantId: string; prompt: string; maxTokens?: number; temperature?: number; topP?: number }
   | { op: "chat_stop"; chatId: string }
   | { op: "mcp"; payload: unknown };

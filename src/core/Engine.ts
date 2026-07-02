@@ -14,6 +14,7 @@ import { createNode } from "./Registry.js";
 import type {
   EdgeSpec,
   MetricEvent,
+  NodeInstanceSpec,
   NodeStateSnapshot,
   NodeStatus,
   PipelineNode,
@@ -34,6 +35,8 @@ export class Engine extends EventEmitter {
   private edges: EdgeSpec[] = [];
   private spec: PipelineSpec | null = null;
   private abort: AbortController | null = null;
+  private _paused = false;
+  private pauseWaiters: Array<() => void> = [];
   readonly artifactsDir: string;
 
   constructor(artifactsDir = process.env.LLMDEV_ARTIFACTS_DIR ?? "artifacts") {
@@ -47,6 +50,40 @@ export class Engine extends EventEmitter {
   get running(): boolean {
     return this.abort !== null;
   }
+
+  get paused(): boolean {
+    return this._paused;
+  }
+
+  /**
+   * Gracefully suspend training: nodes block at the pause gate BETWEEN steps,
+   * so weight matrices and optimizer moments (host + CUDA) stay exactly as
+   * they are — no state is flushed or lost.
+   */
+  pause(): void {
+    if (!this.running || this._paused) return;
+    this._paused = true;
+    this.emitState();
+  }
+
+  resume(): void {
+    if (!this._paused) return;
+    this._paused = false;
+    for (const w of this.pauseWaiters.splice(0)) w();
+    this.emitState();
+  }
+
+  /** Cancel: abort the run AND wake paused nodes so they observe the abort. */
+  stop(): void {
+    this.abort?.abort();
+    this.resume();
+  }
+
+  private waitIfPaused = async (): Promise<void> => {
+    while (this._paused && !this.abort?.signal.aborted) {
+      await new Promise<void>((r) => this.pauseWaiters.push(r));
+    }
+  };
 
   load(spec: PipelineSpec): void {
     if (this.running) throw new Error("Cannot load while running");
@@ -79,8 +116,60 @@ export class Engine extends EventEmitter {
     this.emitState();
   }
 
-  stop(): void {
-    this.abort?.abort();
+  // ── Interactive graph editing (canvas ↔ engine) ────────────────────────
+
+  addNode(spec: NodeInstanceSpec): void {
+    this.assertEditable();
+    if (this.nodes.has(spec.id)) throw new Error(`Duplicate node id: ${spec.id}`);
+    this.nodes.set(spec.id, { spec, node: createNode(spec.type, spec.params), status: "idle" });
+    this.spec?.nodes.push(spec);
+    this.emitState();
+  }
+
+  removeNode(nodeId: string): void {
+    this.assertEditable();
+    if (!this.nodes.delete(nodeId)) throw new Error(`No such node: ${nodeId}`);
+    this.edges = this.edges.filter((e) => e.from.node !== nodeId && e.to.node !== nodeId);
+    if (this.spec) {
+      this.spec.nodes = this.spec.nodes.filter((n) => n.id !== nodeId);
+      this.spec.edges = this.edges;
+    }
+    this.emitState();
+  }
+
+  /** Connect ports with strict dataType validation + cycle rejection. */
+  addEdge(edge: EdgeSpec): void {
+    this.assertEditable();
+    const dup = this.edges.some(
+      (e) => e.to.node === edge.to.node && e.to.port === edge.to.port
+    );
+    if (dup) throw new Error(`Input ${edge.to.node}.${edge.to.port} is already connected`);
+    this.edges.push(edge);
+    if (this.spec) this.spec.edges = this.edges;
+    try {
+      this.validate(); // type-checks ports + rejects cycles
+    } catch (err) {
+      this.edges.pop(); // roll back the invalid edge
+      if (this.spec) this.spec.edges = this.edges;
+      throw err;
+    }
+    this.emitState();
+  }
+
+  removeEdge(edge: EdgeSpec): void {
+    this.assertEditable();
+    this.edges = this.edges.filter(
+      (e) =>
+        !(e.from.node === edge.from.node && e.from.port === edge.from.port &&
+          e.to.node === edge.to.node && e.to.port === edge.to.port)
+    );
+    if (this.spec) this.spec.edges = this.edges;
+    this.emitState();
+  }
+
+  private assertEditable(): void {
+    if (this.running) throw new Error("Stop the pipeline before editing the graph");
+    if (!this.spec) this.spec = { name: "untitled", nodes: [], edges: [] };
   }
 
   /** Kahn topological sort — rejects cycles, dangling edges. */
@@ -170,6 +259,7 @@ export class Engine extends EventEmitter {
           rt.outputs = await rt.node.run(inputs, {
             artifactsDir: this.artifactsDir,
             signal,
+            waitIfPaused: this.waitIfPaused,
             metric: (name, value, extra) => {
               const ev: MetricEvent = { ts: Date.now(), nodeId: id, name, value, extra };
               this.emit("metric", ev);
@@ -186,6 +276,8 @@ export class Engine extends EventEmitter {
       }
     } finally {
       this.abort = null;
+      this._paused = false;
+      for (const w of this.pauseWaiters.splice(0)) w();
       this.emitState();
     }
   }
@@ -203,6 +295,7 @@ export class Engine extends EventEmitter {
     return {
       name: this.spec?.name ?? "(none)",
       running: this.running,
+      paused: this._paused,
       nodes,
       edges: this.edges,
     };
