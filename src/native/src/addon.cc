@@ -25,6 +25,8 @@ void llm_ctx_sync_layer(void* ctx, int layer, const float* wq, const float* wk,
                         const float* wv, const float* wg, const float* wd);
 int llm_attn_last_forward(const float* x, int T, int d, float* out);
 void llm_sgemm(const float* A, const float* B, float* C, int M, int K, int N);
+int llm_sgemm_acc(const float* A, const float* B, float* C, int M, int K, int N,
+                  float alpha);
 }
 
 namespace {
@@ -121,6 +123,18 @@ Napi::Value Sgemm(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
+// sgemmAcc(A[M*K], B[K*N], C[M*N], M, K, N, alpha) — C += alpha·A·B.
+// LoRA forward: adds the scaled low-rank contribution (α/r)·(X·A)·B into the
+// base projection output. Returns false ⇒ caller uses the CPU fallback.
+Napi::Value SgemmAcc(const Napi::CallbackInfo& info) {
+  int ok = llm_sgemm_acc(F32(info[0]), F32(info[1]), F32(info[2]),
+                         info[3].As<Napi::Number>().Int32Value(),
+                         info[4].As<Napi::Number>().Int32Value(),
+                         info[5].As<Napi::Number>().Int32Value(),
+                         info[6].As<Napi::Number>().FloatValue());
+  return Napi::Boolean::New(info.Env(), ok == 1);
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("cudaAvailable", Napi::Function::New(env, CudaAvailable));
   exports.Set("deviceName", Napi::Function::New(env, DeviceName));
@@ -134,6 +148,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("syncLayer", Napi::Function::New(env, SyncLayer));
   exports.Set("attnLastForward", Napi::Function::New(env, AttnLastForward));
   exports.Set("sgemm", Napi::Function::New(env, Sgemm));
+  exports.Set("sgemmAcc", Napi::Function::New(env, SgemmAcc));
   return exports;
 }
 

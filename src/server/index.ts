@@ -140,6 +140,8 @@ function handleOp(msg: ClientMessage, send: (msg: ServerMessage) => void): void 
       return engine.stop(); // abort + wake paused nodes; trainer frees GPU ctx
     case "commit_training":
       return engine.commitEarly(); // freeze weights/moments, node ends 'done'
+    case "update_learning_rate":
+      return engine.setLearningRate(msg.lr); // hot lr swap, loop never pauses
     case "update_params":
       return engine.updateNodeParams(msg.nodeId, msg.params);
     case "move_node":

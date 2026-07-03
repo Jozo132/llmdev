@@ -19,6 +19,7 @@ export type ClientMessage =
   | { op: "resume_training" }
   | { op: "cancel_training" }  // abort + release GPU context / host buffers
   | { op: "commit_training" }  // "Commit & Proceed": freeze weights, finish node as done
+  | { op: "update_learning_rate"; lr: number } // hot-tune Adam lr mid-run, no pause/reset
   | { op: "update_params"; nodeId: string; params: Record<string, unknown> }
   | { op: "move_node"; nodeId: string; position: { x: number; y: number } }
   // ── interactive graph editing ──

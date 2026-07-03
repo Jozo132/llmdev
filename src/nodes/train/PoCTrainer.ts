@@ -11,7 +11,9 @@
  * and loss slots are the seams for CUDA/PyTorch replacements tomorrow.
  */
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { existsSync, mkdirSync, renameSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { TinyLM } from "../../ml/model.js";
 import type {
   ModelConfig, NodeDescriptor, NodeParams, NodeRunContext, PipelineNode,
@@ -51,6 +53,16 @@ const DESCRIPTOR: NodeDescriptor = {
         "training.",
       range: "1e-4 – 5e-3 (Adam)" },
     { key: "logEvery", label: "Log every N steps", type: "number", default: 1 },
+    { key: "checkpoint", label: "Checkpoint name", type: "string", default: "",
+      description: "Warm-start resume slot under <artifacts>/checkpoints/",
+      theory: "When set, the trainer looks for <name>.weights.bin AND " +
+        "<name>.adam.bin. If both exist with matching shapes, random init is " +
+        "skipped entirely: weights stream straight into the hot GPU layer " +
+        "buffers (llm_ctx_sync_layer) and Adam resumes with its exact first/" +
+        "second moments + step counter — the bias-correction schedule " +
+        "continues from where it left off. Both files are re-written " +
+        "atomically after the run.",
+      range: "empty = fresh init every run" },
   ],
 };
 
@@ -81,7 +93,7 @@ export class PoCTrainer implements PipelineNode {
     const config = inputs.config as ModelConfig;
     const tokenRef = inputs.tokens as TokenFileRef;
     if (!config || !tokenRef) throw new Error("Trainer requires 'config' and 'tokens'");
-    const p = this.params as { steps: number; batchSize: number; lr: number; logEvery: number };
+    const p = this.params as { steps: number; batchSize: number; lr: number; logEvery: number; checkpoint?: string };
 
     // Load the shard as raw uint16 — a 2M-token shard is only 4MB of RAM.
     const raw = await readFile(tokenRef.path);
@@ -91,11 +103,47 @@ export class PoCTrainer implements PipelineNode {
       throw new Error(`Shard too small: ${data.length} tokens < window ${windowLen + 1}`);
     }
 
-    const model = new TinyLM(config);
+    // ── Warm-start: resume weights + Adam moments from a checkpoint slot ──
+    const ckptName = String(p.checkpoint ?? "").trim();
+    const ckptDir = path.join(ctx.artifactsDir, "checkpoints");
+    const ckptWeights = ckptName ? path.join(ckptDir, `${ckptName}.weights.bin`) : "";
+    const ckptAdam = ckptName ? path.join(ckptDir, `${ckptName}.adam.bin`) : "";
+    let resumeW: Float32Array | null = null;
+    let resumeS: Float32Array | null = null;
+    if (ckptName && existsSync(ckptWeights) && existsSync(ckptAdam)) {
+      const [wBuf, sBuf] = await Promise.all([readFile(ckptWeights), readFile(ckptAdam)]);
+      const w = new Float32Array(wBuf.buffer, wBuf.byteOffset, Math.floor(wBuf.byteLength / 4));
+      const s = new Float32Array(sBuf.buffer, sBuf.byteOffset, Math.floor(sBuf.byteLength / 4));
+      if (w.length === TinyLM.paramCountFor(config) &&
+          s.length === TinyLM.trainerStateLengthFor(config)) {
+        resumeW = w;
+        resumeS = s;
+      } else {
+        ctx.log(`Checkpoint "${ckptName}" shape mismatch — fresh init instead`);
+      }
+    }
+
+    // Warm start skips random init entirely; loadWeights streams the host
+    // arrays into the hot GPU contexts (syncE + llm_ctx_sync_layer per layer).
+    const model = new TinyLM(config, undefined, { skipInit: !!resumeW });
+    if (resumeW && resumeS) {
+      model.loadWeights(resumeW);
+      model.restoreTrainerState(resumeS);
+      ctx.log(`Warm-start: resumed "${ckptName}" at Adam step ${model.adamStep} — ` +
+              `weights + both optimizer moments restored, device buffers hot`);
+    }
     ctx.log(`TinyLM instantiated: ${model.paramCount.toLocaleString()} parameters ` +
             `across ${model.nLayers} transformer layer(s) ` +
             `(${(model.paramCount * 4 / 1024 / 1024).toFixed(1)}MB fp32) — ` +
             `forward runs layers 0→${model.nLayers - 1}, backward ${model.nLayers - 1}→0`);
+    if (model.isLora) {
+      ctx.log(`LoRA fine-tuning active: r=${config.loraRank ?? 8}, α=${config.loraAlpha ?? 16} ` +
+              `(scale ${model.loraScale.toFixed(3)}) — base weights FROZEN, ` +
+              `${model.loraParams.length.toLocaleString()} trainable adapter params ` +
+              `(${(100 * model.loraParams.length / model.paramCount).toFixed(2)}% of full), ` +
+              `zero per-step host→device weight sync`);
+      ctx.metric("lora_param_count", model.loraParams.length);
+    }
     ctx.metric("param_count", model.paramCount);
     ctx.metric("layer_count", model.nLayers);
 
@@ -107,6 +155,30 @@ export class PoCTrainer implements PipelineNode {
     let finalLoss = NaN;
     let stepsCompleted = 0;
     let committedEarly = false;
+
+    // ── Best-loss checkpoint tracking ──
+    // Every step's loss is compared against the running record; improvements
+    // snapshot weights + full Adam state (host copies) and persist them to
+    // the distinct best.* pair so the FINAL artifacts ship the optimum, not
+    // whatever the last trailing step happened to produce.
+    let lowestRecordLoss = Infinity;
+    let bestWeights: Float32Array | null = null;
+    let bestState: Float32Array | null = null;
+    let bestStep = 0;
+    const ckptBestWeights = ckptName ? path.join(ckptDir, `${ckptName}.best.weights.bin`) : "";
+    const ckptBestAdam = ckptName ? path.join(ckptDir, `${ckptName}.best.adam.bin`) : "";
+    const persistBest = async (): Promise<void> => {
+      if (!ckptName || !bestWeights || !bestState) return;
+      mkdirSync(ckptDir, { recursive: true });
+      const tmpW = `${ckptBestWeights}.tmp-${process.pid}`;
+      const tmpA = `${ckptBestAdam}.tmp-${process.pid}`;
+      await writeFile(tmpW, Buffer.from(bestWeights.buffer, bestWeights.byteOffset, bestWeights.byteLength));
+      await writeFile(tmpA, Buffer.from(bestState.buffer, bestState.byteOffset, bestState.byteLength));
+      renameSync(tmpW, ckptBestWeights);
+      renameSync(tmpA, ckptBestAdam);
+    };
+
+    let activeLr = p.lr;
     try {
       for (let step = 1; step <= p.steps; step++) {
         // Pause gate: blocks between steps — weights + Adam moments stay
@@ -124,12 +196,31 @@ export class PoCTrainer implements PipelineNode {
           ctx.log(`Commit & Proceed at step ${step - 1}/${p.steps} — weights + Adam moments frozen, skipping remaining iterations`);
           break;
         }
+        // Hot lr: read the live override every iteration — the slider frame
+        // lands between steps, so the NEXT Adam update uses the new scalar
+        // with zero pause and zero metric/moment reset.
+        const lrNow = ctx.getLrOverride() ?? p.lr;
+        if (lrNow !== activeLr) {
+          ctx.log(`learning rate hot-swapped ${activeLr.toExponential(2)} → ${lrNow.toExponential(2)} at step ${step} (loop never paused)`);
+          activeLr = lrNow;
+        }
+        ctx.metric("learning_rate", activeLr, { step });
         const batch = Array.from({ length: p.batchSize }, sampleWindow);
         const t0 = performance.now();
-        const { loss, tokensProcessed } = model.step(batch, p.lr);
+        const { loss, tokensProcessed } = model.step(batch, activeLr);
         const dt = (performance.now() - t0) / 1000;
         finalLoss = loss;
         stepsCompleted = step;
+
+        // Best-loss gate: evaluated after EVERY step.
+        if (loss < lowestRecordLoss) {
+          lowestRecordLoss = loss;
+          bestStep = step;
+          bestWeights = model.params.slice();
+          bestState = model.serializeTrainerState();
+          ctx.metric("best_loss", loss, { step });
+          await persistBest(); // best.weights.bin + best.adam.bin
+        }
 
         if (step % p.logEvery === 0 || step === p.steps) {
           const tps = tokensProcessed / dt;
@@ -154,17 +245,49 @@ export class PoCTrainer implements PipelineNode {
       model.backend.dispose();
     }
 
+    // ── Training finalization hook ──
+    // Natural completion AND "Commit & Proceed" both land here: the exported
+    // deployment state is the BEST-loss snapshot, not the last trailing step.
+    const finalWeights = bestWeights ?? model.params;
+    const finalState = bestState ?? model.serializeTrainerState();
+    if (bestWeights) {
+      ctx.log(`Finalizing from best checkpoint: loss ${lowestRecordLoss.toFixed(4)} @ step ${bestStep} ` +
+              `(last step was ${Number.isFinite(finalLoss) ? finalLoss.toFixed(4) : "n/a"})`);
+    }
+
+    // Persist the checkpoint slot atomically (tmp + rename) so the next run
+    // on this variant resumes from the exact optimum captured above.
+    if (ckptName) {
+      mkdirSync(ckptDir, { recursive: true });
+      const tmpW = `${ckptWeights}.tmp-${process.pid}`;
+      const tmpA = `${ckptAdam}.tmp-${process.pid}`;
+      await writeFile(tmpW, Buffer.from(finalWeights.buffer, finalWeights.byteOffset, finalWeights.byteLength));
+      await writeFile(tmpA, Buffer.from(finalState.buffer, finalState.byteOffset, finalState.byteLength));
+      renameSync(tmpW, ckptWeights);
+      renameSync(tmpA, ckptAdam);
+      ctx.log(`Checkpoint "${ckptName}" saved — weights.bin + adam.bin (best-loss state)`);
+    }
+
+    // LoRA adapters live inside the trainer state blob — recover the best
+    // adapter slice so merged/adapter exports also ship the optimum.
+    let finalLora: Float32Array | undefined;
+    if (model.isLora) {
+      const P = model.paramCount, Q = model.loraParams.length;
+      finalLora = bestState ? bestState.slice(1 + 2 * P, 1 + 2 * P + Q) : model.loraParams;
+    }
+
     const handle: TrainedModelHandle = {
       config,
       paramCount: model.paramCount,
-      weights: model.params,
-      finalLoss,
+      weights: finalWeights,
+      ...(finalLora ? { lora: finalLora } : {}),
+      finalLoss: Number.isFinite(lowestRecordLoss) ? lowestRecordLoss : finalLoss,
       stepsCompleted,
     };
     ctx.log(
       committedEarly
-        ? `Training committed early — ${stepsCompleted}/${p.steps} steps, final loss ${finalLoss.toFixed(4)}`
-        : `Training done — final loss ${finalLoss.toFixed(4)}`
+        ? `Training committed early — ${stepsCompleted}/${p.steps} steps, best loss ${lowestRecordLoss.toFixed(4)}`
+        : `Training done — best loss ${Number.isFinite(lowestRecordLoss) ? lowestRecordLoss.toFixed(4) : finalLoss.toFixed(4)}`
     );
     return { model: handle };
   }

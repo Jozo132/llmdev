@@ -79,6 +79,13 @@ export interface NodeRunContext {
    * host/device memory while suspended.
    */
   waitIfPaused(): Promise<void>;
+  /**
+   * Live learning-rate override (update_learning_rate op). Trainers read
+   * this at the top of EVERY step so the user can hot-tune Adam's lr while
+   * the loop is executing — no pause, no halt, no metric reset. null ⇒ use
+   * the node's configured lr.
+   */
+  getLrOverride(): number | null;
 }
 
 /**
@@ -156,6 +163,14 @@ export interface ModelConfig {
   /** KV heads for Grouped-Query Attention (kvHeads < nHeads ⇒ GQA). */
   kvHeads?: number;
   mlp?: "standard" | "swiglu";
+  // ── Fine-tuning mode ──
+  /** "full" (default) trains every parameter; "lora" freezes the base and
+   *  trains low-rank adapters A[d×r]/B[r×d] on the attention q/v projections. */
+  fineTuneMode?: "full" | "lora";
+  /** LoRA rank r (adapter bottleneck width). */
+  loraRank?: number;
+  /** LoRA α — adapter contribution is scaled by α/r. */
+  loraAlpha?: number;
 }
 
 export interface TrainedModelHandle {
@@ -163,6 +178,8 @@ export interface TrainedModelHandle {
   paramCount: number;
   /** Flat parameter buffer — the "1M parameter weight array". */
   weights: Float32Array;
+  /** LoRA adapter buffer (A/B matrices) when fineTuneMode === "lora". */
+  lora?: Float32Array;
   finalLoss: number;
   stepsCompleted: number;
 }

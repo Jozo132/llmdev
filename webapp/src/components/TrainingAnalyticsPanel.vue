@@ -11,11 +11,50 @@
  * prominent "Commit & Proceed" seam — freeze weights + Adam moments mid-epoch
  * and let the engine fire the downstream eval/export nodes immediately.
  */
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import { usePipelineStore } from "../stores/pipeline";
 import type { MetricEvent } from "../types";
 
 const store = usePipelineStore();
+
+// ── Real-time lr hot-tuning ───────────────────────────────────────────
+// Logarithmic slider (1e-7 → 1e-2): position p ∈ [0,1] maps to 10^(-7+5p).
+// Dragging while a trainer is hot sends update_learning_rate; the loop
+// consumes the new scalar on its next Adam step without pausing.
+const LR_MIN_EXP = -7;
+const LR_MAX_EXP = -2;
+const lrSlider = ref(lrToPos(0.003));
+const userTouchedLr = ref(false);
+
+function lrToPos(lr: number): number {
+  const e = Math.log10(Math.min(Math.max(lr, 10 ** LR_MIN_EXP), 10 ** LR_MAX_EXP));
+  return (e - LR_MIN_EXP) / (LR_MAX_EXP - LR_MIN_EXP);
+}
+function posToLr(p: number): number {
+  return 10 ** (LR_MIN_EXP + p * (LR_MAX_EXP - LR_MIN_EXP));
+}
+const activeLr = computed(() => posToLr(lrSlider.value));
+
+function onLrInput() {
+  userTouchedLr.value = true;
+  store.updateLearningRate(activeLr.value);
+}
+
+// Track the trainer's reported lr until the user takes over the slider.
+watch(
+  () => store.history.learning_rate?.length,
+  () => {
+    if (userTouchedLr.value) return;
+    const arr = store.history.learning_rate;
+    if (arr?.length) lrSlider.value = lrToPos(arr[arr.length - 1].value);
+  }
+);
+// New run ⇒ hand slider ownership back to the trainer's configured lr.
+watch(() => store.state?.running, (running) => {
+  if (running) userTouchedLr.value = false;
+});
+
+const fmtLr = (lr: number): string => lr.toExponential(2).replace("e-", "e−");
 
 const W = 960;
 const H = 230;
@@ -144,6 +183,24 @@ const stats = computed(() => {
       </span>
 
       <div class="ml-auto flex items-center gap-2">
+        <!-- ── Live learning-rate hot-tune (log scale 1e-5 → 1e-2) ── -->
+        <div
+          class="flex items-center gap-2 rounded border border-slate-800 bg-panel px-2 py-1"
+          title="Hot-tune Adam's learning rate while training runs — the loop applies it on the very next step without pausing or resetting metrics"
+        >
+          <span class="text-[10px] uppercase tracking-widest text-slate-500">lr</span>
+          <input
+            v-model.number="lrSlider"
+            type="range"
+            min="0"
+            max="1"
+            step="0.001"
+            class="h-1 w-36 cursor-pointer accent-amber-400"
+            :disabled="!store.state?.running"
+            @input="onLrInput"
+          />
+          <span class="w-16 text-right font-mono text-[11px] text-amber-300">{{ fmtLr(activeLr) }}</span>
+        </div>
         <button
           v-if="store.state?.running && !store.state?.paused"
           class="rounded bg-amber-700 px-3 py-1.5 text-xs font-semibold hover:bg-amber-600"

@@ -266,6 +266,8 @@ export class JsIngestionNode implements PipelineNode {
         const body = (await scoped.json()) as unknown;
         if (Array.isArray(body)) files = body.filter((u): u is string => typeof u === "string");
       } else {
+        // 400 (malformed/unknown scoped path) and every other non-ok status:
+        // fall back to parsing the top-level root export index.
         ctx.log(`[ingest] Scoped parquet endpoint ${scoped.status} for ${cfg}/${spl} — defaulting to root export index.`);
       }
     } catch (err) {
@@ -273,36 +275,59 @@ export class JsIngestionNode implements PipelineNode {
       ctx.log(`[ingest] Scoped parquet endpoint failed (${(err as Error).message}) — defaulting to root export index.`);
     }
     if (!files.length) {
-      // Root index fallback — flat array of entries, each carrying its own
-      // case-sensitive `config` (and usually `split`) tag plus a download
-      // `url`. Filter by exact config match rather than assuming a nested
-      // object shape.
+      // Root index fallback — https://huggingface.co/api/datasets/<id>/parquet
+      // Two manifest shapes exist in the wild:
+      //   · flat array of file entries [{ config, split, url }, …]
+      //   · nested object { "<config>": { "<split>": [url, …] } }  (live shape)
+      // Config keys are CASE-SENSITIVE ("JavaScript-mit", "C++-all", …).
       const idxRes = await fetch(`${HF_HUB}/api/datasets/${dataset}/parquet`, { headers, signal: ctx.signal });
       if (!idxRes.ok) {
         throw new Error(`Parquet index ${idxRes.status} for ${dataset} — both rows API and raw fallback failed.`);
       }
       const index = (await idxRes.json()) as unknown;
-      const entries = Array.isArray(index) ? (index as Record<string, unknown>[]) : [];
-      // Normalized form ("javascript-mit") tolerates hyphenation/case drift
-      // between the exact config id and whatever the manifest actually ships.
-      const norm = (s: unknown) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
-      const cfgNorm = norm(cfg);
-      const matches = (rec: Record<string, unknown>): boolean => {
-        if (rec.config === cfg) return true;
-        return norm(rec.config) === cfgNorm;
+
+      // Collect ALL partitions the manifest publishes for one exact config key.
+      const partsFor = (cfgKey: string): string[] => {
+        const parts: string[] = [];
+        if (Array.isArray(index)) {
+          // Explicit filtering loop — EXACT case-sensitive `item.config` match;
+          // append every available file partition into the download list.
+          for (const item of index as Array<Record<string, unknown>>) {
+            if (!item || typeof item !== "object") continue;
+            const splitOk = !("split" in item) ||
+              item.split === spl || String(item.split ?? "").toLowerCase() === spl;
+            if (item.config === cfgKey && splitOk && typeof item.url === "string") {
+              parts.push(item.url);
+            }
+          }
+        } else if (index && typeof index === "object") {
+          const bySplit = (index as Record<string, Record<string, unknown>>)[cfgKey];
+          const urls = bySplit?.[spl];
+          if (Array.isArray(urls)) {
+            for (const u of urls) if (typeof u === "string") parts.push(u);
+          }
+        }
+        return parts;
       };
-      const matched = entries.filter((item): item is Record<string, unknown> => {
-        if (!item || typeof item !== "object") return false;
-        const rec = item as Record<string, unknown>;
-        if (!matches(rec)) return false;
-        return !("split" in rec) || rec.split === spl || norm(rec.split) === norm(spl);
-      });
-      if (!matched.length && entries.length) {
-        ctx.log(`[ingest] No manifest entry matched config "${cfg}" — sample entry: ${JSON.stringify(entries[0])}`);
+
+      // Starvation-proof degradation chain: the export index only publishes a
+      // subset of configs (verified live: TypeScript/GO/Shell have NO per-
+      // language export and non-JS "-mit" keys don't exist). Try the exact
+      // requested key first, then the "-all" license variant of the same
+      // language, then the mixed-language "all-mit" corpus.
+      const candidates = [cfg];
+      const langOnly = cfg.replace(/-(mit|all)$/, "");
+      if (!cfg.endsWith("-all")) candidates.push(`${langOnly}-all`);
+      if (cfg !== "all-mit") candidates.push("all-mit");
+      let usedKey = cfg;
+      for (const key of candidates) {
+        const parts = partsFor(key);
+        if (parts.length) { files = parts; usedKey = key; break; }
       }
-      files = matched
-        .map((item) => item.url)
-        .filter((u): u is string => typeof u === "string");
+
+      // Single tracking line: total file parts discovered for this config.
+      console.log(`[ingest] parquet root index: ${files.length} file part(s) discovered for config "${cfg}"${usedKey !== cfg ? ` (served by fallback config "${usedKey}")` : ""} — split ${spl}`);
+      ctx.log(`[ingest] parquet root index: ${files.length} file part(s) for "${cfg}"${usedKey !== cfg ? ` via "${usedKey}"` : ""}`);
     }
     if (!files.length) {
       ctx.log(`Parquet index has no files for ${cfg}/${spl} — skipping config.`);

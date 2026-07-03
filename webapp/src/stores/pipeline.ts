@@ -81,13 +81,32 @@ export const usePipelineStore = defineStore("pipeline", {
       if (this._ws) return;
       const ws = new WebSocket(WS_URL);
       this._ws = ws;
-      ws.onopen = () => (this.connected = true);
+      ws.onopen = () => {
+        this.connected = true;
+        // E2E canvas restore: hydrate the project list and replay the active
+        // project's persisted graph (SQLite graph_nodes/graph_edges rows) —
+        // the server rebuilds the engine graph and broadcasts a full state
+        // snapshot carrying every node's params + exact (x, y) position.
+        this.restoreActiveProject();
+      };
       ws.onclose = () => {
         this.connected = false;
         this._ws = null;
         setTimeout(() => this.connect(), 2000); // auto-reconnect
       };
       ws.onmessage = (e) => this.handle(JSON.parse(e.data) as ServerMessage);
+    },
+
+    /**
+     * Trigger the backend load_project op for the active project. The server
+     * reads the stored graph_nodes/graph_edges rows, re-instantiates the
+     * engine graph (params + positions intact) and broadcasts "state";
+     * idempotent — a missing project simply adopts the current canvas.
+     */
+    restoreActiveProject() {
+      if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+      this.send({ op: "list_projects" });
+      this.send({ op: "load_project", projectId: this.activeProjectId, name: this.state?.name });
     },
 
     handle(msg: ServerMessage) {
@@ -246,6 +265,13 @@ export const usePipelineStore = defineStore("pipeline", {
     /** "Commit & Proceed": freeze weights/moments now, node completes as done. */
     commitTraining() {
       this.send({ op: "commit_training" });
+    },
+    /**
+     * Real-time lr hot-tuning: the running trainer reads the new scalar at
+     * the top of its NEXT step — no pause, no halt, no step-metric reset.
+     */
+    updateLearningRate(lr: number) {
+      this.send({ op: "update_learning_rate", lr });
     },
 
     // ── interactive graph editing (optimism deferred to the state broadcast —

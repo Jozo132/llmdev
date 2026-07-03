@@ -143,6 +143,7 @@ export type ClientMessage =
   | { op: "resume_training" }
   | { op: "cancel_training" }
   | { op: "commit_training" }
+  | { op: "update_learning_rate"; lr: number }
   | { op: "update_params"; nodeId: string; params: Record<string, unknown> }
   | { op: "move_node"; nodeId: string; position: { x: number; y: number } }
   | { op: "add_node"; node: NodeInstanceSpec }

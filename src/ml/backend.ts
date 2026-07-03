@@ -106,6 +106,10 @@ interface NativeAddon {
   ): void;
   attnLastForward(x: Float32Array, T: number, d: number, out: Float32Array): boolean;
   sgemm(A: Float32Array, B: Float32Array, C: Float32Array, M: number, K: number, N: number): void;
+  sgemmAcc(
+    A: Float32Array, B: Float32Array, C: Float32Array,
+    M: number, K: number, N: number, alpha: number
+  ): boolean;
 }
 
 const require_ = createRequire(import.meta.url);
@@ -131,6 +135,22 @@ export function gpuSgemm(
 ): void {
   if (!cudaAvailable()) throw new Error("CUDA addon not available");
   addon!.sgemm(A, B, C, M, K, N);
+}
+
+/**
+ * LoRA accumulate on-device: C += alpha·A·B. Returns false (⇒ CPU fallback)
+ * when the addon is missing or the kernel launch fails.
+ */
+export function gpuSgemmAcc(
+  A: Float32Array, B: Float32Array, C: Float32Array,
+  M: number, K: number, N: number, alpha: number
+): boolean {
+  if (!cudaAvailable()) return false;
+  try {
+    return addon!.sgemmAcc(A, B, C, M, K, N, alpha);
+  } catch {
+    return false;
+  }
 }
 
 /**

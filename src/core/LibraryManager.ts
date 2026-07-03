@@ -325,16 +325,37 @@ export class LibraryManager extends EventEmitter {
       const data = new Uint16Array(raw.buffer, raw.byteOffset, Math.floor(raw.byteLength / 2));
       const windowLen = variant.config.contextLength;
 
-      const model = new TinyLM(variant.config);
-      // Warm-start from existing weights when shapes line up.
+      // ── Warm-start: existing weight checkpoint + Adam optimizer state ──
+      const adamPath = path.join(path.dirname(variant.weightsPath), "adam.bin");
+      let warmW: Float32Array | null = null;
       if (existsSync(variant.weightsPath)) {
         const w = await readFile(variant.weightsPath);
         const f32 = new Float32Array(w.buffer, w.byteOffset, Math.floor(w.byteLength / 4));
-        if (f32.length === model.paramCount) model.params.set(f32);
+        if (f32.length === paramCountOf(variant.config)) warmW = f32;
       }
-      model.backend.syncE();
+      // Matching checkpoint ⇒ skip random init entirely; loadWeights streams
+      // the host arrays into the hot GPU contexts (syncE + llm_ctx_sync_layer
+      // for every layer's discrete device buffers).
+      const model = new TinyLM(variant.config, undefined, { skipInit: !!warmW });
+      if (warmW) {
+        model.loadWeights(warmW);
+        if (existsSync(adamPath)) {
+          const s = await readFile(adamPath);
+          const f32 = new Float32Array(s.buffer, s.byteOffset, Math.floor(s.byteLength / 4));
+          model.restoreTrainerState(f32); // exact Adam moments + step counter
+        }
+      }
 
       let finalLoss = NaN;
+      // Best-loss checkpoint engine: track the record-low training loss and
+      // serialize the optimal weights + Adam registers to a distinct pair in
+      // the variant directory the moment a new record lands.
+      const dir = path.dirname(variant.weightsPath);
+      const bestWeightsPath = path.join(dir, "best.weights.bin");
+      const bestAdamPath = path.join(dir, "best.adam.bin");
+      let lowestRecordLoss = Infinity;
+      let bestWeights: Float32Array | null = null;
+      let bestState: Float32Array | null = null;
       for (let step = 1; step <= steps; step++) {
         if (abort.signal.aborted) break;
         const batch = Array.from({ length: batchSize }, () => {
@@ -344,6 +365,18 @@ export class LibraryManager extends EventEmitter {
         const t0 = performance.now();
         const { loss, tokensProcessed } = model.step(batch, lr);
         finalLoss = loss;
+        // End-of-step best-loss gate.
+        if (loss < lowestRecordLoss) {
+          lowestRecordLoss = loss;
+          bestWeights = model.params.slice();
+          bestState = model.serializeTrainerState();
+          const tmpW = path.join(dir, `.best.weights.tmp-${process.pid}`);
+          const tmpA = path.join(dir, `.best.adam.tmp-${process.pid}`);
+          await writeFile(tmpW, Buffer.from(bestWeights.buffer, bestWeights.byteOffset, bestWeights.byteLength));
+          await writeFile(tmpA, Buffer.from(bestState.buffer, bestState.byteOffset, bestState.byteLength));
+          renameSync(tmpW, bestWeightsPath);
+          renameSync(tmpA, bestAdamPath);
+        }
         const metric: VariantMetric = {
           variantId,
           step,
@@ -355,17 +388,28 @@ export class LibraryManager extends EventEmitter {
         await new Promise((r) => setImmediate(r)); // keep WS + other trainers live
       }
 
+      // Finalization hook: the deployed variant weights are the BEST-loss
+      // snapshot (natural completion and stop/abort alike), not whatever the
+      // last trailing step produced.
+      const finalWeights = bestWeights ?? model.params;
+      const finalState = bestState ?? model.serializeTrainerState();
+
       // Materialize weights atomically: write tmp, then rename over the
       // (possibly symlinked) weights file — the parent stays untouched.
-      const dir = path.dirname(variant.weightsPath);
       const tmp = path.join(dir, `.weights.tmp-${process.pid}`);
-      await writeFile(tmp, Buffer.from(model.params.buffer, model.params.byteOffset, model.params.byteLength));
+      await writeFile(tmp, Buffer.from(finalWeights.buffer, finalWeights.byteOffset, finalWeights.byteLength));
       if (existsSync(variant.weightsPath) && lstatSync(variant.weightsPath).isSymbolicLink()) {
         unlinkSync(variant.weightsPath);
       }
       renameSync(tmp, variant.weightsPath);
 
-      variant.finalLoss = finalLoss;
+      // Persist the matching optimizer state next to the weights so the NEXT
+      // run resumes seamlessly from this exact optimum (both moments + step).
+      const tmpAdam = path.join(dir, `.adam.tmp-${process.pid}`);
+      await writeFile(tmpAdam, Buffer.from(finalState.buffer, finalState.byteOffset, finalState.byteLength));
+      renameSync(tmpAdam, adamPath);
+
+      variant.finalLoss = Number.isFinite(lowestRecordLoss) ? lowestRecordLoss : finalLoss;
       variant.history = variant.history.slice(-200); // bounded benchmark history
       writeFileSync(path.join(dir, "model.json"), JSON.stringify({ ...variant, training: false }, null, 2));
       model.backend.dispose(); // release device buffers promptly
@@ -384,14 +428,13 @@ export class LibraryManager extends EventEmitter {
     if (!existsSync(variant.weightsPath)) {
       throw new Error(`Variant "${variant.name}" has no trained weights yet`);
     }
-    const model = new TinyLM(variant.config);
+    const model = new TinyLM(variant.config, undefined, { skipInit: true });
     const w = await readFile(variant.weightsPath);
     const f32 = new Float32Array(w.buffer, w.byteOffset, Math.floor(w.byteLength / 4));
     if (f32.length !== model.paramCount) {
       throw new Error(`Weight shape mismatch: ${f32.length} vs ${model.paramCount}`);
     }
-    model.params.set(f32);
-    model.backend.syncE();
+    model.loadWeights(f32); // syncE + per-layer device mirrors
 
     if (!variant.tokenizerPath || !existsSync(variant.tokenizerPath)) {
       throw new Error(`No tokenizer found for "${variant.name}"`);

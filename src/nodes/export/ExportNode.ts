@@ -6,7 +6,7 @@
 import { writeFile } from "node:fs/promises";
 import { statSync } from "node:fs";
 import path from "node:path";
-import { sliceTensors, writeGguf, writeSafetensors } from "../../core/Exporters.js";
+import { sliceTensors, writeGguf, writeSafetensors, loraAdapterTensors, mergeLoraWeights } from "../../core/Exporters.js";
 import { TinyLM } from "../../ml/model.js";
 import type {
   ExportedArtifact, NodeDescriptor, NodeParams, NodeRunContext, PipelineNode,
@@ -38,6 +38,15 @@ const DESCRIPTOR: NodeDescriptor = {
         "runner container. safetensors = HuggingFace/PyTorch loading via " +
         "safetensors.torch.load_file().",
       range: "any subset of bin,gguf,safetensors" },
+    { key: "loraMode", label: "LoRA export", type: "select",
+      options: ["merged", "adapter"], default: "merged",
+      description: "Only applies when the model trained with LoRA",
+      theory: "merged: fuse the low-rank delta back into the base " +
+        "(W' = W + (α/r)·A·B) ⇒ a standard full checkpoint any tinylm-v1 " +
+        "runtime loads with zero adapter support. adapter: export ONLY the " +
+        "A/B tensors (<blk>.attn_{q,v}.lora_{a,b}) — a few hundred KB that " +
+        "re-applies onto the original base.",
+      range: "merged for deployment · adapter for sharing/stacking" },
   ],
 };
 
@@ -60,7 +69,23 @@ export class ExportNode implements PipelineNode {
     const formats = String(this.params.formats ?? "bin")
       .split(",").map((f) => f.trim().toLowerCase()).filter(Boolean);
 
-    const tensors = sliceTensors(handle.weights, TinyLM.tensorLayout(handle.config));
+    const layout = TinyLM.tensorLayout(handle.config);
+    const adapterOnly = handle.lora && String(this.params.loraMode) === "adapter";
+    let weights = handle.weights;
+    let tensors = sliceTensors(weights, layout);
+    if (handle.lora?.length) {
+      const adapters = TinyLM.loraAdaptersFor(handle.config, handle.lora);
+      if (adapterOnly) {
+        tensors = loraAdapterTensors(adapters);
+        ctx.log(`LoRA adapter export: ${tensors.length} tensors, ` +
+                `${(handle.lora.length * 4 / 1024).toFixed(1)}KB isolated adapter`);
+      } else {
+        weights = mergeLoraWeights(handle.weights, layout, adapters);
+        tensors = sliceTensors(weights, layout);
+        ctx.log(`LoRA merged export: delta (α/r)·A·B fused into ${adapters.length} ` +
+                `base tensors — standard full checkpoint`);
+      }
+    }
     let primary: ExportedArtifact | null = null;
     const emit = (p: string) => {
       const bytes = statSync(p).size;
@@ -71,18 +96,20 @@ export class ExportNode implements PipelineNode {
 
     if (formats.includes("bin")) {
       const header = {
-        format: "tinylm-v1",
+        format: adapterOnly ? "tinylm-lora-v1" : "tinylm-v1",
         config: handle.config,
         paramCount: handle.paramCount,
+        ...(adapterOnly ? { loraParamCount: handle.lora!.length } : {}),
         finalLoss: handle.finalLoss,
         stepsCompleted: handle.stepsCompleted,
         dtype: "float32-le",
         exportedAt: new Date().toISOString(),
       };
       await writeFile(`${base}.json`, JSON.stringify(header, null, 2));
+      const payload = adapterOnly ? handle.lora! : weights;
       await writeFile(
         `${base}.weights.bin`,
-        Buffer.from(handle.weights.buffer, handle.weights.byteOffset, handle.weights.byteLength)
+        Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)
       );
       emit(`${base}.weights.bin`);
     }

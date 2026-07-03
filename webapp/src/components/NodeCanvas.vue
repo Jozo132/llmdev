@@ -72,6 +72,26 @@ function applyTemplate(templateId: string) {
   store.applyTemplate(templateId);
   pendingLayout.value = true;
 }
+
+// ── E2E restore guard ──────────────────────────────────────────────────
+// Persisted graphs replay with their exact stored (x, y) placements; a graph
+// that predates position persistence (every node parked at the origin) gets
+// one deterministic auto-layout pass — which immediately round-trips back to
+// SQLite through the debounced save_graph mutation in store.moveNode().
+const restoredOnce = ref(false);
+watch(
+  () => store.state?.nodes.length,
+  (len) => {
+    if (restoredOnce.value || !len) return;
+    restoredOnce.value = true;
+    const nodes = store.state!.nodes;
+    const allUnplaced = nodes.every(
+      (n) => !n.position || (n.position.x === 0 && n.position.y === 0)
+    );
+    if (allUnplaced && nodes.length > 1) void nextTick(autoLayout);
+  },
+  { immediate: true }
+);
 watch(
   () => store.state?.name,
   () => {

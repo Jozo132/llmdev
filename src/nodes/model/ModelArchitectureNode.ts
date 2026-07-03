@@ -84,6 +84,26 @@ const DESCRIPTOR: NodeDescriptor = {
         "softmax(z) − onehot(y) — bounded and well-scaled, which is why LM " +
         "training is stable. exp(loss) = perplexity.",
       range: "cross-entropy (add z-loss/MoE-aux via registerLoss)" },
+    { key: "fineTuneMode", label: "Fine-Tuning Mode", type: "select",
+      options: ["Full Parameter", "LoRA (Low-Rank Adaptation)"], default: "Full Parameter",
+      theory: "Full Parameter trains every weight. LoRA freezes the base and " +
+        "injects trainable low-rank adapters on the attention q/v projections: " +
+        "W' = W + (α/r)·A·B with A∈R^{d×r} gaussian-init and B∈R^{r×d} " +
+        "zero-init (initial delta = 0, so training starts from the exact base " +
+        "model). Only A/B receive gradients — optimizer state shrinks from " +
+        "2×params to 2×(4·L·d·r) and per-step host→device weight sync drops " +
+        "to ZERO because the frozen base never changes on-device.",
+      range: "LoRA for fine-tuning a warm-started checkpoint" },
+    { key: "loraRank", label: "LoRA Rank (r)", type: "number", default: 8,
+      theory: "Adapter bottleneck width. Trainable params scale linearly with " +
+        "r; expressiveness saturates quickly — r=8–16 matches full fine-tune " +
+        "quality on most adaptation tasks (LoRA paper, Tab. 6).",
+      range: "4–64" },
+    { key: "loraAlpha", label: "LoRA Alpha (α)", type: "number", default: 16,
+      theory: "Adapter output scale α/r. Keeping α fixed while sweeping r " +
+        "keeps the effective adapter learning rate constant; α = 2r is the " +
+        "common heuristic.",
+      range: "8–64 (typically 2× rank)" },
   ],
 };
 
@@ -105,7 +125,9 @@ export class ModelArchitectureNode implements PipelineNode {
       dModel: number; hiddenDim: number; contextLength: number;
       nLayers: number; nHeads: number; kvHeads: number;
       mlp: "standard" | "swiglu"; mixer: string; loss: string;
+      fineTuneMode: string; loraRank: number; loraAlpha: number;
     };
+    const loraOn = /lora/i.test(String(p.fineTuneMode ?? ""));
     const config: ModelConfig = {
       vocabSize: tokens.vocabSize,
       dModel: p.dModel,
@@ -117,6 +139,8 @@ export class ModelArchitectureNode implements PipelineNode {
       nHeads: p.nHeads,
       kvHeads: p.kvHeads,
       mlp: p.mlp,
+      fineTuneMode: loraOn ? "lora" : "full",
+      ...(loraOn ? { loraRank: p.loraRank, loraAlpha: p.loraAlpha } : {}),
     };
 
     // Design-formula parameter count (matches the live canvas calculator).
@@ -128,6 +152,10 @@ export class ModelArchitectureNode implements PipelineNode {
     });
     for (const line of breakdown.formula) ctx.log(line);
     ctx.metric("param_count", breakdown.total);
+    if (loraOn) {
+      ctx.log(`Fine-tuning mode: LoRA r=${p.loraRank}, α=${p.loraAlpha} — base frozen, ` +
+              `adapters on attn q/v (${4 * (p.nLayers ?? 1) * p.dModel * p.loraRank} trainable params)`);
+    }
     ctx.log(`Design total: ${fmtParams(breakdown.total)} params (${p.mixer}, L=${p.nLayers}, h=${p.nHeads}/kv=${p.kvHeads})`);
     return { config, tokens };
   }

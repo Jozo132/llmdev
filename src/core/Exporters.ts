@@ -169,3 +169,61 @@ export function sliceTensors(
     return { name, shape, data: weights.subarray(offset, offset + size) };
   });
 }
+
+// ── LoRA export ──────────────────────────────────────────────────────────
+
+export interface LoraAdapter {
+  /** Base tensor name the adapter targets, e.g. "blk.0.attn_q.weight". */
+  target: string;
+  A: Float32Array;   // [d × r]
+  B: Float32Array;   // [r × d]
+  scale: number;     // α/r
+  d: number;
+  r: number;
+}
+
+/**
+ * Fuse LoRA deltas back into a full checkpoint: for every adapter,
+ * W' = W + scale·A·B on a COPY of the flat weight buffer — the result is a
+ * standard layer configuration loadable by any tinylm-v1 consumer with no
+ * adapter support required.
+ */
+export function mergeLoraWeights(
+  weights: Float32Array,
+  layout: Array<{ name: string; offset: number; shape: number[] }>,
+  adapters: LoraAdapter[]
+): Float32Array {
+  const merged = weights.slice();
+  const byName = new Map(layout.map((t) => [t.name, t]));
+  for (const { target, A, B, scale, d, r } of adapters) {
+    const entry = byName.get(target);
+    if (!entry) throw new Error(`LoRA merge: unknown target tensor "${target}"`);
+    const off = entry.offset;
+    // W'[j,c] += scale · Σ_ρ A[j,ρ]·B[ρ,c]
+    for (let j = 0; j < d; j++) {
+      for (let rho = 0; rho < r; rho++) {
+        const w = scale * A[j * r + rho];
+        if (w === 0) continue;
+        for (let c = 0; c < d; c++) merged[off + j * d + c] += w * B[rho * d + c];
+      }
+    }
+  }
+  return merged;
+}
+
+/**
+ * Isolated adapter tensors (PEFT-style naming: <target>.lora_a / .lora_b)
+ * for exporting the adapter alone — a few hundred KB instead of the full
+ * checkpoint.
+ */
+export function loraAdapterTensors(adapters: LoraAdapter[]): NamedTensor[] {
+  const out: NamedTensor[] = [];
+  for (const { target, A, B, d, r } of adapters) {
+    const stem = target.replace(/\.weight$/, "");
+    out.push(
+      { name: `${stem}.lora_a`, shape: [d, r], data: A },
+      { name: `${stem}.lora_b`, shape: [r, d], data: B },
+    );
+  }
+  return out;
+}

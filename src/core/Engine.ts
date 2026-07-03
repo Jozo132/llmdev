@@ -39,6 +39,8 @@ export class Engine extends EventEmitter {
   private pauseWaiters: Array<() => void> = [];
   /** "Commit Early" flag — scoped to the currently executing node. */
   private commitFlag = false;
+  /** Live lr override — written by update_learning_rate, read hot per step. */
+  private lrOverride: number | null = null;
   readonly artifactsDir: string;
 
   constructor(artifactsDir = process.env.LLMDEV_ARTIFACTS_DIR ?? "artifacts") {
@@ -90,6 +92,18 @@ export class Engine extends EventEmitter {
     if (!this.running) return;
     this.commitFlag = true;
     this.resume(); // wake a paused loop so it can observe the commit
+  }
+
+  /**
+   * Real-time lr hot-tuning: update the active scalar consumed by the running
+   * training loop's NEXT Adam step. The loop never pauses and step metrics
+   * are untouched — the trainer simply reads the new value on its next
+   * iteration (between CUDA kernel launches, so device state stays coherent).
+   */
+  setLearningRate(lr: number): void {
+    if (!Number.isFinite(lr) || lr <= 0) throw new Error(`Invalid learning rate: ${lr}`);
+    this.lrOverride = lr;
+    this.emit("log", { nodeId: "", message: `learning rate hot-tuned → ${lr.toExponential(2)}` });
   }
 
   private waitIfPaused = async (): Promise<void> => {
@@ -310,12 +324,14 @@ export class Engine extends EventEmitter {
           } as MetricEvent);
         }, 1000);
         this.commitFlag = false; // commit control is scoped per node
+        this.lrOverride = null;  // lr override is scoped per node run
         try {
           rt.outputs = await rt.node.run(inputs, {
             artifactsDir: this.artifactsDir,
             signal,
             shouldCommit: () => this.commitFlag,
             waitIfPaused: this.waitIfPaused,
+            getLrOverride: () => this.lrOverride,
             metric: emitMetric,
             log: (message) => this.emit("log", { nodeId: id, message }),
           });

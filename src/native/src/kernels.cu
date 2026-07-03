@@ -121,6 +121,29 @@ __global__ void k_sgemm(const float* __restrict__ A, const float* __restrict__ B
   if (row < M && col < N) C[row * (long)N + col] = acc;
 }
 
+// LoRA accumulate variant: C[M×N] += alpha · A[M×K]·B[K×N].
+// Used for the low-rank adapter contribution h += (α/r)·(X·A)·B where the
+// tiny [T×r] activation X·A is precomputed on the host and B ∈ R^{r×d}.
+__global__ void k_sgemm_acc(const float* __restrict__ A, const float* __restrict__ B,
+                            float* __restrict__ C, int M, int K, int N, float alpha) {
+  __shared__ float As[TILE][TILE];
+  __shared__ float Bs[TILE][TILE];
+  int row = blockIdx.y * TILE + threadIdx.y;
+  int col = blockIdx.x * TILE + threadIdx.x;
+  float acc = 0.f;
+  for (int t = 0; t < (K + TILE - 1) / TILE; t++) {
+    int ak = t * TILE + threadIdx.x;
+    int bk = t * TILE + threadIdx.y;
+    As[threadIdx.y][threadIdx.x] = (row < M && ak < K) ? A[row * (long)K + ak] : 0.f;
+    Bs[threadIdx.y][threadIdx.x] = (bk < K && col < N) ? B[bk * (long)N + col] : 0.f;
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < TILE; k++) acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+    __syncthreads();
+  }
+  if (row < M && col < N) C[row * (long)N + col] += alpha * acc;
+}
+
 // ── Flash-style attention: last-query row, tiled KV slicing ───────────────
 // Computes out = softmax(q·K^T/√d)·V for q = x[T-1], K = V = x, WITHOUT ever
 // materializing the T×T score matrix: keys stream through a shared-memory
@@ -386,6 +409,36 @@ void llm_sgemm(const float* A, const float* B, float* C, int M, int K, int N) {
   cudaFree(dA);
   cudaFree(dB);
   cudaFree(dC);
+}
+
+// LoRA forward accumulate: C += alpha·A·B (see k_sgemm_acc). Returns 0 on
+// launch failure so the caller falls back to the CPU path instead of
+// silently keeping a stale C.
+int llm_sgemm_acc(const float* A, const float* B, float* C, int M, int K, int N,
+                  float alpha) {
+  float *dA, *dB, *dC;
+  CUDA_CHECK(cudaMalloc(&dA, (size_t)M * K * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dB, (size_t)K * N * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dC, (size_t)M * N * sizeof(float)));
+  CUDA_CHECK(cudaMemcpy(dA, A, (size_t)M * K * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, B, (size_t)K * N * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dC, C, (size_t)M * N * sizeof(float), cudaMemcpyHostToDevice));
+  dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+  dim3 block(TILE, TILE);
+  k_sgemm_acc<<<grid, block>>>(dA, dB, dC, M, K, N, alpha);
+  cudaError_t launchErr = cudaGetLastError();
+  int ok = 1;
+  if (launchErr != cudaSuccess) {
+    fprintf(stderr, "CUDA kernel launch error %s at %s:%d\n",
+            cudaGetErrorString(launchErr), __FILE__, __LINE__);
+    ok = 0;
+  } else {
+    CUDA_CHECK(cudaMemcpy(C, dC, (size_t)M * N * sizeof(float), cudaMemcpyDeviceToHost));
+  }
+  cudaFree(dA);
+  cudaFree(dB);
+  cudaFree(dC);
+  return ok;
 }
 
 }  // extern "C"
