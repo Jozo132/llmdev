@@ -6,20 +6,88 @@
  */
 import { defineStore } from "pinia";
 import type {
-  ArchTemplate, ClientMessage, EdgeSpec, MetricEvent, ModelVariant, NodeDescriptor,
-  NodeInstanceSpec, PipelineStateSnapshot, ServerMessage, VariantMetric,
+  ArchTemplate, ChatSessionMeta, ClientMessage, EdgeSpec, MetricEvent, ModelAcceptanceProposal,
+  ModelVariant, NodeDescriptor, NodeInstanceSpec, PipelineStateSnapshot,
+  ServerMessage, VariantMetric,
 } from "../types";
 
 const WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${location.hostname}:8881`;
 const METRIC_HISTORY = 300;
-const ANALYTICS_HISTORY = 50_000; // non-truncated historic charts (safety cap)
+const ANALYTICS_HISTORY = 2_048;
+const ANALYTICS_COMPACT_AT = ANALYTICS_HISTORY * 2;
 const GRAPH_SAVE_DEBOUNCE_MS = 600; // coalesce drag/param bursts into one save
 
+function pushRecent<T>(arr: T[], item: T, limit: number): void {
+  arr.push(item);
+  if (arr.length > limit) arr.splice(0, arr.length - limit);
+}
+
+function compactAnalyticsSeries(points: MetricEvent[]): void {
+  if (points.length <= ANALYTICS_COMPACT_AT) return;
+  const compacted: MetricEvent[] = [];
+  for (let i = 0; i < points.length; i += 2) compacted.push(points[i]);
+  const last = points[points.length - 1];
+  if (compacted[compacted.length - 1] !== last) compacted.push(last);
+  points.splice(0, points.length, ...compacted);
+}
+
+function pushAnalytics(points: MetricEvent[], metric: MetricEvent): void {
+  points.push(metric);
+  compactAnalyticsSeries(points);
+}
+
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function latestNodeMetric(history: Record<string, MetricEvent[]>, name: string, nodeId?: string): number | null {
+  const points = history[name] ?? [];
+  for (let i = points.length - 1; i >= 0; i--) {
+    if (!nodeId || points[i].nodeId === nodeId) return points[i].value;
+  }
+  return null;
+}
+
+function techStack(config: Record<string, unknown>, backend = "backend ?"): string[] {
+  const loraOn = config.fineTuneMode === "lora" || /lora/i.test(String(config.fineTuneMode ?? ""));
+  const esOn = Boolean(config.stochasticExplorationPool);
+  const mlp = String(config.mlp ?? "standard");
+  const stack = [
+    backend,
+    String(config.mixer ?? "causal-mean"),
+    mlp === "swiglu" ? "SwiGLU" : "MLP",
+    String(config.loss ?? "cross-entropy"),
+    loraOn ? "LoRA" : "Full Adam",
+  ];
+  if (esOn) stack.push(loraOn ? "ES population" : "ES temporal");
+  return stack;
+}
+
 export interface ChatMessage {
-  role: "user" | "assistant" | "tool";
+  role: "user" | "assistant" | "system" | "tool";
   text: string;
   streaming?: boolean;
   variantId?: string;
+  attachments?: PendingAttachment[];
+}
+
+export interface PendingAttachment {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  content: string;
+}
+
+export interface CommitConfirmation {
+  oldTrainLoss: number | null;
+  newTrainLoss: number | null;
+  trainLossDelta: number | null;
+  oldDatasetLoss: number | null;
+  newDatasetLoss: number | null;
+  datasetLossDelta: number | null;
+  oldTechStack: string[];
+  newTechStack: string[];
 }
 
 export const usePipelineStore = defineStore("pipeline", {
@@ -28,12 +96,13 @@ export const usePipelineStore = defineStore("pipeline", {
     state: null as PipelineStateSnapshot | null,
     catalog: [] as NodeDescriptor[],
     templates: [] as ArchTemplate[],
-    metrics: {} as Record<string, MetricEvent[]>, // keyed by metric name
-    history: {} as Record<string, MetricEvent[]>, // non-truncated analytics series
+    metrics: {} as Record<string, MetricEvent[]>, // recent keyed by metric name
+    history: {} as Record<string, MetricEvent[]>, // bounded, decimated analytics series
     nodeProgress: {} as Record<string, number>,   // nodeId → 0..1 live progress
     nodeTimes: {} as Record<string, number>,      // nodeId → execution_time_ms
     nodeElapsed: {} as Record<string, number>,    // nodeId → elapsedTimeMs (live)
     nodeEta: {} as Record<string, number>,        // nodeId → windowed etaMs
+    runtime: null as { backend: string; deviceName?: string | null } | null,
     workers: [] as Array<{ id: string; capabilities: Record<string, unknown>; connectedAt: string }>,
     logs: [] as Array<{ nodeId: string; message: string }>,
     selectedNodeId: null as string | null,
@@ -41,12 +110,17 @@ export const usePipelineStore = defineStore("pipeline", {
     // ── model library ──
     library: [] as ModelVariant[],
     variantMetrics: {} as Record<string, VariantMetric[]>, // live sparklines
+    pendingModelAcceptance: null as ModelAcceptanceProposal | null,
+    pendingCommitConfirmation: null as CommitConfirmation | null,
     /** Variant the user tried to open while a heavy process holds memory. */
     pendingOpenId: null as string | null,
     // ── chat sandbox ──
+    chatSessions: [] as ChatSessionMeta[],
+    activeChatSessionId: null as string | null,
     chatMessages: [] as ChatMessage[],
     activeChatId: null as string | null,
     chatVariantId: null as string | null,
+    pendingAttachments: [] as PendingAttachment[],
     mcpLog: [] as unknown[],
     mcpTools: [] as Array<{ name: string; description: string }>,
     // ── project persistence (SQLite warehouse) ──
@@ -88,6 +162,7 @@ export const usePipelineStore = defineStore("pipeline", {
         // the server rebuilds the engine graph and broadcasts a full state
         // snapshot carrying every node's params + exact (x, y) position.
         this.restoreActiveProject();
+        this.refreshChats();
       };
       ws.onclose = () => {
         this.connected = false;
@@ -114,6 +189,9 @@ export const usePipelineStore = defineStore("pipeline", {
         case "state":
           this.state = msg.state;
           break;
+        case "runtime":
+          this.runtime = { backend: msg.backend, deviceName: msg.deviceName };
+          break;
         case "catalog":
           this.catalog = msg.descriptors;
           break;
@@ -139,11 +217,9 @@ export const usePipelineStore = defineStore("pipeline", {
             break;
           }
           const arr = (this.metrics[msg.metric.name] ??= []);
-          arr.push(msg.metric);
-          if (arr.length > METRIC_HISTORY) arr.shift();
+          pushRecent(arr, msg.metric, METRIC_HISTORY);
           const hist = (this.history[msg.metric.name] ??= []);
-          hist.push(msg.metric);
-          if (hist.length > ANALYTICS_HISTORY) hist.shift();
+          pushAnalytics(hist, msg.metric);
           break;
         }
         case "log":
@@ -159,10 +235,12 @@ export const usePipelineStore = defineStore("pipeline", {
             this.chatVariantId = msg.variants[0].id;
           }
           break;
+        case "model_acceptance_required":
+          this.pendingModelAcceptance = msg.proposal;
+          break;
         case "variant_metric": {
           const arr = (this.variantMetrics[msg.metric.variantId] ??= []);
-          arr.push(msg.metric);
-          if (arr.length > METRIC_HISTORY) arr.shift();
+          pushRecent(arr, msg.metric, METRIC_HISTORY);
           break;
         }
         case "chat_token": {
@@ -177,6 +255,7 @@ export const usePipelineStore = defineStore("pipeline", {
           if (last?.streaming) last.streaming = false;
           if (msg.reason === "error" && msg.message) this.lastError = msg.message;
           this.activeChatId = null;
+          this.send({ op: "list_chats" });
           break;
         }
         case "mcp_result": {
@@ -196,13 +275,26 @@ export const usePipelineStore = defineStore("pipeline", {
         case "projects":
           this.projects = msg.projects;
           break;
+        case "chats":
+          this.chatSessions = msg.sessions;
+          break;
+        case "chat_session":
+          this.activeChatSessionId = msg.session.id;
+          this.chatVariantId = msg.session.variantId ?? this.chatVariantId;
+          this.chatMessages = msg.session.messages.map((message) => ({
+            role: message.role,
+            text: message.text,
+            variantId: message.variantId ?? undefined,
+          }));
+          break;
         case "worker_event":
           break; // reserved: remote-worker telemetry mirror
       }
     },
 
     send(msg: ClientMessage) {
-      this._ws?.send(JSON.stringify(msg));
+      if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+      this._ws.send(JSON.stringify(msg));
     },
 
     /**
@@ -248,7 +340,7 @@ export const usePipelineStore = defineStore("pipeline", {
       this.nodeTimes = {};
       this.nodeElapsed = {};
       this.nodeEta = {};
-      this.send({ op: "run" });
+      this.send({ op: "run", projectId: this.activeProjectId });
     },
     stop() {
       this.send({ op: "stop" });
@@ -264,7 +356,41 @@ export const usePipelineStore = defineStore("pipeline", {
     },
     /** "Commit & Proceed": freeze weights/moments now, node completes as done. */
     commitTraining() {
+      this.pendingCommitConfirmation = this.buildCommitConfirmation();
+    },
+    confirmCommitTraining() {
+      this.pendingCommitConfirmation = null;
       this.send({ op: "commit_training" });
+    },
+    cancelCommitTraining() {
+      this.pendingCommitConfirmation = null;
+    },
+    acceptModelResult(proposalId: string) {
+      this.pendingModelAcceptance = null;
+      this.send({ op: "accept_model_result", proposalId });
+    },
+    rejectModelResult(proposalId: string) {
+      this.pendingModelAcceptance = null;
+      this.send({ op: "reject_model_result", proposalId });
+    },
+    buildCommitConfirmation(): CommitConfirmation {
+      const active = this.library.find((variant) => variant.id === this.activeProjectId);
+      const train = this.state?.nodes.find((node) => node.type === "train.poc");
+      const arch = this.state?.nodes.find((node) => node.type === "model.architecture");
+      const newTrainLoss = latestNodeMetric(this.history, "best_loss", train?.id) ?? latestNodeMetric(this.history, "loss", train?.id);
+      const newDatasetLoss = latestNodeMetric(this.history, "eval_loss") ?? newTrainLoss;
+      const oldTrainLoss = finiteOrNull(active?.finalLoss);
+      const oldDatasetLoss = finiteOrNull(active?.datasetLoss ?? active?.finalLoss);
+      return {
+        oldTrainLoss,
+        newTrainLoss,
+        trainLossDelta: oldTrainLoss != null && newTrainLoss != null ? newTrainLoss - oldTrainLoss : null,
+        oldDatasetLoss,
+        newDatasetLoss,
+        datasetLossDelta: oldDatasetLoss != null && newDatasetLoss != null ? newDatasetLoss - oldDatasetLoss : null,
+        oldTechStack: active ? techStack(active.config as unknown as Record<string, unknown>, this.runtime?.backend) : [],
+        newTechStack: arch ? techStack(arch.params, this.runtime?.backend) : [],
+      };
     },
     /**
      * Real-time lr hot-tuning: the running trainer reads the new scalar at
@@ -272,6 +398,10 @@ export const usePipelineStore = defineStore("pipeline", {
      */
     updateLearningRate(lr: number) {
       this.send({ op: "update_learning_rate", lr });
+    },
+
+    resetModel(nodeId: string) {
+      this.send({ op: "reset_model", nodeId });
     },
 
     // ── interactive graph editing (optimism deferred to the state broadcast —
@@ -376,16 +506,67 @@ export const usePipelineStore = defineStore("pipeline", {
     },
 
     // ── chat sandbox ──
+    refreshChats() {
+      this.send({ op: "list_chats" });
+    },
+    newChat(variantId?: string | null) {
+      const selectedVariantId = variantId ?? this.chatVariantId;
+      const sessionId = crypto.randomUUID();
+      const title = "New chat";
+      this.activeChatSessionId = sessionId;
+      this.chatMessages = [];
+      this.pendingAttachments = [];
+      if (selectedVariantId) this.chatVariantId = selectedVariantId;
+      this.chatSessions = [{ id: sessionId, title, variantId: selectedVariantId ?? null, createdAt: Date.now(), updatedAt: Date.now() }, ...this.chatSessions];
+      this.send({ op: "create_chat", sessionId, title, variantId: selectedVariantId ?? null });
+    },
+    loadChatSession(sessionId: string) {
+      if (this.activeChatId) return;
+      this.send({ op: "load_chat", sessionId });
+    },
+    renameChatSession(sessionId: string, title: string) {
+      const trimmed = title.trim() || "New chat";
+      const session = this.chatSessions.find((candidate) => candidate.id === sessionId);
+      if (session) session.title = trimmed;
+      this.send({ op: "rename_chat", sessionId, title: trimmed });
+    },
+    deleteChatSession(sessionId: string) {
+      this.chatSessions = this.chatSessions.filter((session) => session.id !== sessionId);
+      if (this.activeChatSessionId === sessionId) {
+        this.activeChatSessionId = null;
+        this.chatMessages = [];
+        this.activeChatId = null;
+      }
+      this.send({ op: "delete_chat", sessionId });
+    },
+    addPendingAttachment(file: PendingAttachment) {
+      this.pendingAttachments.push(file);
+    },
+    removePendingAttachment(id: string) {
+      this.pendingAttachments = this.pendingAttachments.filter((file) => file.id !== id);
+    },
+    clearPendingAttachments() {
+      this.pendingAttachments = [];
+    },
     sendChat(prompt: string, maxTokens = 96, temperature = 0.8, topP = 1) {
       if (!this.chatVariantId || this.activeChatId) return;
+      if (!this.activeChatSessionId) this.newChat(this.chatVariantId);
+      if (!this.activeChatSessionId) return;
       const chatId = crypto.randomUUID();
+      const attachments = this.pendingAttachments.slice();
+      const attachmentPrefix = attachments.length
+        ? attachments.map((file) => `<file name="${file.name}" type="${file.type || "text/plain"}">\n${file.content}\n</file>`).join("\n\n")
+        : "";
+      const fullPrompt = attachmentPrefix ? `${attachmentPrefix}\n\n${prompt}` : prompt;
       this.activeChatId = chatId;
-      this.chatMessages.push({ role: "user", text: prompt });
+      const visiblePrompt = attachmentPrefix ? `${attachmentPrefix}\n\n${prompt}` : prompt;
+      this.chatMessages.push({ role: "user", text: visiblePrompt, attachments });
+      this.pendingAttachments = [];
       this.chatMessages.push({
         role: "assistant", text: "", streaming: true, variantId: this.chatVariantId,
       });
       this.send({
-        op: "chat_send", chatId, variantId: this.chatVariantId, prompt, maxTokens, temperature, topP,
+        op: "chat_send", chatId, sessionId: this.activeChatSessionId, variantId: this.chatVariantId, prompt: fullPrompt, maxTokens, temperature, topP,
       });
     },
     stopChat() {

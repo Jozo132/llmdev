@@ -27,6 +27,12 @@ int llm_attn_last_forward(const float* x, int T, int d, float* out);
 void llm_sgemm(const float* A, const float* B, float* C, int M, int K, int N);
 int llm_sgemm_acc(const float* A, const float* B, float* C, int M, int K, int N,
                   float alpha);
+int llm_es_mutate_population(const float* base, float* population, int paramCount,
+                             int populationSize, int iterationStep, float sigma);
+int llm_ctx_reduce_fittest(float* base, float* population, const float* losses,
+                           int paramCount, int populationSize, int survivorCount,
+                           int iterationStep, float blend, float sigma,
+                           float* metrics);
 }
 
 namespace {
@@ -135,6 +141,33 @@ Napi::Value SgemmAcc(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(info.Env(), ok == 1);
 }
 
+// stochasticMutate(base[Q], population[P*Q], Q, P, step, sigma) → bool
+Napi::Value StochasticMutate(const Napi::CallbackInfo& info) {
+  int ok = llm_es_mutate_population(
+    F32(info[0]), F32(info[1]),
+    info[2].As<Napi::Number>().Int32Value(),
+    info[3].As<Napi::Number>().Int32Value(),
+    info[4].As<Napi::Number>().Int32Value(),
+    info[5].As<Napi::Number>().FloatValue()
+  );
+  return Napi::Boolean::New(info.Env(), ok == 1);
+}
+
+// reduceFittest(base[Q], population[P*Q], losses[P], Q, P, N, step, blend, sigma, metrics[3]) → bool
+Napi::Value ReduceFittest(const Napi::CallbackInfo& info) {
+  int ok = llm_ctx_reduce_fittest(
+    F32(info[0]), F32(info[1]), F32(info[2]),
+    info[3].As<Napi::Number>().Int32Value(),
+    info[4].As<Napi::Number>().Int32Value(),
+    info[5].As<Napi::Number>().Int32Value(),
+    info[6].As<Napi::Number>().Int32Value(),
+    info[7].As<Napi::Number>().FloatValue(),
+    info[8].As<Napi::Number>().FloatValue(),
+    F32(info[9])
+  );
+  return Napi::Boolean::New(info.Env(), ok == 1);
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("cudaAvailable", Napi::Function::New(env, CudaAvailable));
   exports.Set("deviceName", Napi::Function::New(env, DeviceName));
@@ -149,6 +182,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("attnLastForward", Napi::Function::New(env, AttnLastForward));
   exports.Set("sgemm", Napi::Function::New(env, Sgemm));
   exports.Set("sgemmAcc", Napi::Function::New(env, SgemmAcc));
+  exports.Set("stochasticMutate", Napi::Function::New(env, StochasticMutate));
+  exports.Set("reduceFittest", Napi::Function::New(env, ReduceFittest));
   return exports;
 }
 

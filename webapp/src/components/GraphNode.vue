@@ -1,6 +1,6 @@
 <script lang="ts">
 export const NODE_W = 190;
-export const NODE_H = 74;
+export const NODE_H = 104;
 </script>
 
 <script setup lang="ts">
@@ -36,10 +36,9 @@ const accent = computed(() => CATEGORY_COLORS[descriptor.value?.category ?? "cus
 const pos = computed(() => props.node.position ?? { x: 0, y: 0 });
 
 /** Labels derive from live parameter configuration — never hardcoded sizes. */
-const displayLabel = computed(() => {
-  if (descriptor.value?.category !== "train") return props.node.label;
+const modelSizeLabel = computed(() => {
   const arch = store.state?.nodes.find((n) => n.type === "model.architecture");
-  if (!arch) return props.node.label;
+  if (!arch) return null;
   const tok = store.state?.nodes.find((n) => n.type === "tokenizer.byteBpe");
   const p = arch.params as Record<string, unknown>;
   const total = countParams({
@@ -53,7 +52,51 @@ const displayLabel = computed(() => {
     mlp: (p.mlp as "standard" | "swiglu") ?? "standard",
     tieEmbeddings: true,
   }).total;
-  return `${props.node.label} (${fmtParams(total)})`;
+  return fmtParams(total);
+});
+
+const displayLabel = computed(() => props.node.label);
+
+const latestNodeMetric = (name: string, nodeId = props.node.id): number | null => {
+  const points = store.history[name] ?? [];
+  for (let i = points.length - 1; i >= 0; i--) {
+    if (points[i].nodeId === nodeId) return points[i].value;
+  }
+  return null;
+};
+
+const lossKpi = computed(() => {
+  if (props.node.type !== "train.poc" && props.node.type !== "model.architecture") return null;
+  const train = props.node.type === "train.poc"
+    ? props.node
+    : store.state?.nodes.find((n) => n.type === "train.poc");
+  if (!train) return null;
+  const best = latestNodeMetric("best_loss", train.id);
+  const live = latestNodeMetric("loss", train.id);
+  const value = best ?? live;
+  return value == null ? "loss --" : `${best != null ? "best" : "loss"} ${value.toFixed(3)}`;
+});
+
+const techStack = computed(() => {
+  if (props.node.type !== "model.architecture" && props.node.type !== "train.poc") return [] as string[];
+  const arch = props.node.type === "model.architecture"
+    ? props.node
+    : store.state?.nodes.find((n) => n.type === "model.architecture");
+  if (!arch) return [] as string[];
+  const p = arch.params as Record<string, unknown>;
+  const loraOn = /lora/i.test(String(p.fineTuneMode ?? ""));
+  const esOn = Boolean(p.stochasticExplorationPool);
+  const mlp = String(p.mlp ?? "standard");
+  const backend = store.runtime?.backend ?? "backend ?";
+  const stack = [
+    backend,
+    String(p.mixer ?? "causal-mean"),
+    mlp === "swiglu" ? "SwiGLU" : "MLP",
+    String(p.loss ?? "cross-entropy"),
+    loraOn ? "LoRA" : "Full Adam",
+  ];
+  if (esOn) stack.push(loraOn ? "ES population" : "ES temporal");
+  return stack;
 });
 
 /** Live 0..1 progress streamed as node_progress metrics. */
@@ -101,6 +144,27 @@ const statusText = computed(() => {
   return STATUS_BADGE[props.node.status].text;
 });
 
+const modeBadge = computed(() => {
+  if (props.node.type !== "model.architecture") return null;
+  const p = props.node.params as Record<string, unknown>;
+  const loraOn = /lora/i.test(String(p.fineTuneMode ?? ""));
+  const esOn = Boolean(p.stochasticExplorationPool);
+  if (!esOn) return loraOn ? "LoRA · ES off" : "Full · ES off";
+  if (!loraOn) return "Full · ES P=1";
+  const populationSize = Math.max(1, Math.round(Number(p.populationSize ?? 4)));
+  const survivalRate = Math.min(100, Math.max(1, Number(p.survivalRate ?? 25)));
+  const survivalCount = Math.max(1, Math.min(populationSize, Math.ceil(populationSize * survivalRate / 100)));
+  return `LoRA · ES P=${populationSize}/N=${survivalCount}`;
+});
+
+const primaryKpis = computed(() => {
+  if (props.node.type !== "model.architecture" && props.node.type !== "train.poc") return [] as string[];
+  return [
+    modelSizeLabel.value ? `size ${modelSizeLabel.value}` : null,
+    lossKpi.value,
+  ].filter(Boolean) as string[];
+});
+
 /** Input ports glow when they can accept the in-flight connection. */
 const acceptsPending = (p: PortSpec) =>
   props.pendingDataType !== null && p.dataType === props.pendingDataType;
@@ -129,17 +193,27 @@ const acceptsPending = (p: PortSpec) =>
     <!-- category stripe -->
     <rect width="6" :height="NODE_H" rx="3" :fill="accent" />
 
-    <text x="16" y="24" class="fill-slate-100 text-[13px] font-semibold">{{ displayLabel }}</text>
-    <text x="16" y="42" class="fill-slate-500 text-[10px] font-mono">{{ node.id }} · {{ node.type }}</text>
-    <text x="16" y="58" class="text-[11px]" :class="STATUS_BADGE[node.status].cls">
+    <text x="16" y="22" class="fill-slate-100 text-[13px] font-semibold">{{ displayLabel }}</text>
+    <text x="16" y="38" class="fill-slate-500 text-[10px] font-mono">{{ node.id }} · {{ node.type }}</text>
+    <text v-if="primaryKpis.length" x="16" y="54" class="fill-amber-300 text-[10px] font-mono">
+      {{ primaryKpis.join(' · ') }}
+    </text>
+    <text v-if="modeBadge" x="16" y="70" class="fill-cyan-300 text-[10px] font-mono">{{ modeBadge }}</text>
+    <text v-else-if="techStack.length" x="16" y="70" class="fill-cyan-300 text-[10px] font-mono">
+      {{ techStack.slice(0, 3).join(' · ') }}
+    </text>
+    <text v-if="techStack.length" x="16" y="86" class="fill-slate-400 text-[9px] font-mono">
+      {{ techStack.slice(modeBadge ? 0 : 3, modeBadge ? 3 : 6).join(' · ') }}
+    </text>
+    <text x="16" y="100" class="text-[10px]" :class="STATUS_BADGE[node.status].cls">
       {{ statusText }}
       <tspan v-if="node.error" class="fill-red-400"> — {{ node.error.slice(0, 24) }}</tspan>
     </text>
 
     <!-- live progress bar (node_progress 0..1 streamed over WebSockets) -->
     <g v-if="node.status === 'running' && progress !== null">
-      <rect x="16" y="64" :width="NODE_W - 32" height="4" rx="2" class="fill-slate-700" />
-      <rect x="16" y="64" :width="Math.max(2, (NODE_W - 32) * Math.min(1, progress))" height="4" rx="2" :fill="accent" />
+      <rect x="16" y="96" :width="NODE_W - 32" height="4" rx="2" class="fill-slate-700" />
+      <rect x="16" y="96" :width="Math.max(2, (NODE_W - 32) * Math.min(1, progress))" height="4" rx="2" :fill="accent" />
     </g>
 
     <!-- elapsed / windowed-velocity ETA readout next to the status indicator -->

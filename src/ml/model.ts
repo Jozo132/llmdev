@@ -318,6 +318,29 @@ export class TinyLM {
     this.syncLayerWeights();
   }
 
+  loadLoraAdapters(lora: Float32Array): void {
+    if (lora.length !== this.loraParams.length) {
+      throw new Error(`LoRA shape mismatch: ${lora.length} vs ${this.loraParams.length}`);
+    }
+    this.loraParams.set(lora);
+  }
+
+  evalLossWithWeights(batch: Uint16Array[], weights: Float32Array): number {
+    const saved = this.params.slice();
+    this.loadWeights(weights);
+    const loss = this.evalLoss(batch);
+    this.loadWeights(saved);
+    return loss;
+  }
+
+  evalLossWithLora(batch: Uint16Array[], lora: Float32Array): number {
+    const saved = this.loraParams.slice();
+    this.loadLoraAdapters(lora);
+    const loss = this.evalLoss(batch);
+    this.loadLoraAdapters(saved);
+    return loss;
+  }
+
   /** Expected serializeTrainerState length for a config (adam.bin contract). */
   static trainerStateLengthFor(cfg: ModelConfig): number {
     return 1 + 2 * TinyLM.paramCountFor(cfg) + 3 * TinyLM.loraParamCountFor(cfg);

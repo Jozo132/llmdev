@@ -110,6 +110,15 @@ interface NativeAddon {
     A: Float32Array, B: Float32Array, C: Float32Array,
     M: number, K: number, N: number, alpha: number
   ): boolean;
+  stochasticMutate(
+    base: Float32Array, population: Float32Array,
+    paramCount: number, populationSize: number, step: number, sigma: number
+  ): boolean;
+  reduceFittest(
+    base: Float32Array, population: Float32Array, losses: Float32Array,
+    paramCount: number, populationSize: number, survivorCount: number,
+    step: number, blend: number, sigma: number, metrics: Float32Array
+  ): boolean;
 }
 
 const require_ = createRequire(import.meta.url);
@@ -150,6 +159,36 @@ export function gpuSgemmAcc(
     return addon!.sgemmAcc(A, B, C, M, K, N, alpha);
   } catch {
     return false;
+  }
+}
+
+export function gpuStochasticMutate(
+  base: Float32Array, population: Float32Array,
+  paramCount: number, populationSize: number, step: number, sigma: number
+): boolean {
+  if (!cudaAvailable()) return false;
+  try {
+    return addon!.stochasticMutate(base, population, paramCount, populationSize, step, sigma);
+  } catch {
+    return false;
+  }
+}
+
+export function gpuReduceFittest(
+  base: Float32Array, population: Float32Array, losses: Float32Array,
+  paramCount: number, populationSize: number, survivorCount: number,
+  step: number, blend: number, sigma: number
+): { ok: boolean; bestLoss: number; variance: number; bestIndex: number } {
+  const metrics = new Float32Array(3);
+  if (!cudaAvailable()) return { ok: false, bestLoss: Infinity, variance: 0, bestIndex: -1 };
+  try {
+    const ok = addon!.reduceFittest(
+      base, population, losses, paramCount, populationSize, survivorCount,
+      step, blend, sigma, metrics
+    );
+    return { ok, bestLoss: metrics[0], variance: metrics[1], bestIndex: metrics[2] };
+  } catch {
+    return { ok: false, bestLoss: Infinity, variance: 0, bestIndex: -1 };
   }
 }
 

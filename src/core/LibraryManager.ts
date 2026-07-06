@@ -23,7 +23,8 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { TinyLM } from "../ml/model.js";
 import { ByteBpeTokenizer } from "../ml/tokenizer.js";
-import type { ModelConfig } from "./types.js";
+import { mergeLoraWeights } from "./Exporters.js";
+import type { ModelConfig, TrainedModelHandle } from "./types.js";
 
 export interface BenchmarkPoint {
   step: number;
@@ -42,6 +43,7 @@ export interface ModelVariant {
   tokenizerPath?: string;
   createdAt: string;
   finalLoss?: number;
+  datasetLoss?: number;
   history: BenchmarkPoint[];
   training: boolean;
 }
@@ -303,6 +305,59 @@ export class LibraryManager extends EventEmitter {
 
   stopTraining(id: string): void {
     this.aborts.get(id)?.abort();
+  }
+
+  persistPipelineResult(variantId: string, handle: TrainedModelHandle, datasetLoss?: number): void {
+    const variant = this.list().find((v) => v.id === variantId);
+    if (!variant) return;
+    const dir = path.dirname(variant.weightsPath);
+    mkdirSync(dir, { recursive: true });
+    let weights = handle.weights;
+    if (handle.lora?.length) {
+      weights = mergeLoraWeights(
+        handle.weights,
+        TinyLM.tensorLayout(handle.config),
+        TinyLM.loraAdaptersFor(handle.config, handle.lora),
+      );
+    }
+    const tmp = path.join(dir, `.weights.pipeline.tmp-${process.pid}`);
+    writeFileSync(tmp, Buffer.from(weights.buffer, weights.byteOffset, weights.byteLength));
+    if (existsSync(variant.weightsPath) && lstatSync(variant.weightsPath).isSymbolicLink()) {
+      unlinkSync(variant.weightsPath);
+    }
+    renameSync(tmp, variant.weightsPath);
+    if (variant.source === "clone") {
+      const metaPath = path.join(dir, "model.json");
+      const meta = existsSync(metaPath)
+        ? JSON.parse(readFileSync(metaPath, "utf8")) as ModelVariant
+        : variant;
+      meta.config = handle.config;
+      meta.paramCount = handle.paramCount;
+      meta.weightsPath = variant.weightsPath;
+      meta.finalLoss = handle.finalLoss;
+      if (datasetLoss != null && Number.isFinite(datasetLoss)) meta.datasetLoss = datasetLoss;
+      meta.history = [
+        ...(meta.history ?? []),
+        { step: handle.stepsCompleted, loss: handle.finalLoss, ts: Date.now() },
+      ].slice(-200);
+      meta.training = false;
+      writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+    } else {
+      const headerPath = path.join(this.exportsDir, `${variant.name}.json`);
+      const prior = existsSync(headerPath) ? JSON.parse(readFileSync(headerPath, "utf8")) : {};
+      writeFileSync(headerPath, JSON.stringify({
+        ...prior,
+        format: "tinylm-v1",
+        config: handle.config,
+        paramCount: handle.paramCount,
+        finalLoss: handle.finalLoss,
+        ...(datasetLoss != null && Number.isFinite(datasetLoss) ? { datasetLoss } : {}),
+        stepsCompleted: handle.stepsCompleted,
+        dtype: "float32-le",
+        exportedAt: new Date().toISOString(),
+      }, null, 2));
+    }
+    this.emit("library", this.list());
   }
 
   async train(variantId: string, opts: { steps?: number; batchSize?: number; lr?: number } = {}): Promise<void> {

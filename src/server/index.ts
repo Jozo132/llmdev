@@ -12,21 +12,22 @@
  * The same Engine instance backs the broker and the CLI, so a pipeline
  * started headlessly is mirrored on every connected canvas in real time.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import path from "node:path";
 import "../nodes/index.js"; // register built-in node types
 
 // Load secrets (HF_TOKEN…) from the gitignored .env when run standalone.
 try { process.loadEnvFile(".env"); } catch { /* no .env — fine */ }
 import { Engine } from "../core/Engine.js";
-import { LibraryManager } from "../core/LibraryManager.js";
+import { LibraryManager, type ModelVariant } from "../core/LibraryManager.js";
 import { getDatasetDB } from "../core/DatasetDB.js";
 import { listDescriptors } from "../core/Registry.js";
 import { TEMPLATES } from "../core/templates.js";
 import { cudaAvailable, cudaDeviceName } from "../ml/backend.js";
-import type { PipelineSpec } from "../core/types.js";
+import type { PipelineSpec, TrainedModelHandle } from "../core/types.js";
 import { MessageBroker } from "./broker.js";
 import { createMcpHandler } from "./mcp.js";
-import type { ClientMessage, ServerMessage } from "./protocol.js";
+import type { ClientMessage, ModelAcceptanceProposal, ServerMessage } from "./protocol.js";
 
 const PORT = Number(process.env.LLMDEV_WS_PORT ?? 8881);
 const engine = new Engine();
@@ -38,6 +39,12 @@ const mcp = createMcpHandler(library);
 const chatAborts = new Map<string, AbortController>();
 
 const DEFAULT_PROJECT_ID = "default";
+const pendingAcceptances = new Map<string, { projectId: string; handle: TrainedModelHandle; datasetLoss?: number }>();
+
+function runtimeInfo(): { backend: string; deviceName?: string | null } {
+  const deviceName = cudaAvailable() ? cudaDeviceName() : null;
+  return { backend: deviceName ? "CUDA" : "js-cpu", deviceName };
+}
 
 /** Snapshot the live engine graph into the SQLite warehouse (one transaction). */
 function persistGraph(projectId = DEFAULT_PROJECT_ID, name?: string): void {
@@ -76,6 +83,115 @@ function restoreProject(projectId: string): boolean {
   return true;
 }
 
+function resetTrainerCheckpoint(nodeId: string): void {
+  if (engine.running) throw new Error("Stop the pipeline before resetting model weights");
+  const node = engine.snapshot().nodes.find((candidate) => candidate.id === nodeId);
+  if (!node) throw new Error(`No such node: ${nodeId}`);
+  if (node.type !== "train.poc") throw new Error("Reset model is only available on trainer nodes");
+  const explicitCheckpoint = String(node.params.checkpoint ?? "").trim();
+  const ckptName = explicitCheckpoint || `node-${nodeId}`;
+  const ckptDir = path.join(engine.artifactsDir, "checkpoints");
+  const files = [
+    `${ckptName}.weights.bin`,
+    `${ckptName}.adam.bin`,
+    `${ckptName}.best.weights.bin`,
+    `${ckptName}.best.adam.bin`,
+  ].map((file) => path.join(ckptDir, file));
+  let removed = 0;
+  for (const file of files) {
+    if (!existsSync(file)) continue;
+    unlinkSync(file);
+    removed++;
+  }
+  broker.broadcast({ ev: "log", nodeId, message: `Reset model checkpoint "${ckptName}" (${removed} file${removed === 1 ? "" : "s"} removed)` });
+}
+
+function techStack(config: Record<string, unknown>): string[] {
+  const loraOn = config.fineTuneMode === "lora";
+  const esOn = Boolean(config.stochasticExplorationPool);
+  const mlp = String(config.mlp ?? "standard");
+  const stack = [
+    runtimeInfo().backend,
+    String(config.mixer ?? "causal-mean"),
+    mlp === "swiglu" ? "SwiGLU" : "MLP",
+    String(config.loss ?? "cross-entropy"),
+    loraOn ? "LoRA" : "Full Adam",
+  ];
+  if (esOn) stack.push(loraOn ? "ES population" : "ES temporal");
+  return stack;
+}
+
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function latestRunReportLoss(): number | undefined {
+  const outputs = engine.outputsByNode();
+  for (const nodeOutputs of Object.values(outputs)) {
+    const report = nodeOutputs.report as { loss?: unknown } | undefined;
+    const loss = finiteOrNull(report?.loss);
+    if (loss != null) return loss;
+  }
+  return undefined;
+}
+
+function buildAcceptanceProposal(
+  id: string, variant: ModelVariant, handle: TrainedModelHandle, datasetLoss?: number
+): ModelAcceptanceProposal {
+  const oldTrainLoss = finiteOrNull(variant.finalLoss);
+  const newTrainLoss = finiteOrNull(handle.finalLoss);
+  const oldDatasetLoss = finiteOrNull(variant.datasetLoss ?? variant.finalLoss);
+  const newDatasetLoss = finiteOrNull(datasetLoss ?? handle.finalLoss);
+  return {
+    id,
+    projectId: variant.id,
+    modelName: variant.name,
+    oldTrainLoss,
+    newTrainLoss,
+    trainLossDelta: oldTrainLoss != null && newTrainLoss != null ? newTrainLoss - oldTrainLoss : null,
+    oldDatasetLoss,
+    newDatasetLoss,
+    datasetLossDelta: oldDatasetLoss != null && newDatasetLoss != null ? newDatasetLoss - oldDatasetLoss : null,
+    oldTechStack: techStack(variant.config as unknown as Record<string, unknown>),
+    newTechStack: techStack(handle.config as unknown as Record<string, unknown>),
+  };
+}
+
+function createRunAcceptance(projectId?: string): void {
+  if (!projectId || projectId === DEFAULT_PROJECT_ID) return;
+  const variant = library.list().find((candidate) => candidate.id === projectId);
+  if (!variant) return;
+  const outputs = engine.outputsByNode();
+  for (const nodeOutputs of Object.values(outputs)) {
+    const model = nodeOutputs.model as TrainedModelHandle | undefined;
+    if (!model?.weights || !model.config) continue;
+    const datasetLoss = latestRunReportLoss() ?? model.finalLoss;
+    const proposalId = `${projectId}:${Date.now().toString(36)}`;
+    pendingAcceptances.set(proposalId, { projectId, handle: model, datasetLoss });
+    broker.broadcast({
+      ev: "model_acceptance_required",
+      proposal: buildAcceptanceProposal(proposalId, variant, model, datasetLoss),
+    });
+    return;
+  }
+}
+
+function acceptModelResult(proposalId: string): void {
+  const pending = pendingAcceptances.get(proposalId);
+  if (!pending) throw new Error("No pending model result to accept");
+  library.persistPipelineResult(pending.projectId, pending.handle, pending.datasetLoss);
+  pendingAcceptances.delete(proposalId);
+  broker.broadcast({ ev: "log", nodeId: "", message: `Accepted model result for "${pending.projectId}"` });
+  broker.broadcast({ ev: "library", variants: library.list() });
+}
+
+function rejectModelResult(proposalId: string): void {
+  const pending = pendingAcceptances.get(proposalId);
+  if (!pending) return;
+  pendingAcceptances.delete(proposalId);
+  broker.broadcast({ ev: "log", nodeId: "", message: `Rejected model result for "${pending.projectId}"; library weights unchanged` });
+}
+
 // Optionally preload a pipeline: `npm run server -- pipelines/poc-js-1m.json`
 const preload = process.argv[2];
 if (preload) {
@@ -83,25 +199,36 @@ if (preload) {
   console.log(`Preloaded pipeline: ${preload}`);
 }
 // ── Token-by-token local chat inference ──────────────────────────────
+function broadcastChats(): void {
+  broker.broadcast({ ev: "chats", sessions: datasets.listChats() });
+}
+
 async function runChat(
-  chatId: string, variantId: string, prompt: string,
+  chatId: string, sessionId: string, variantId: string, prompt: string,
   maxTokens: number, temperature: number, topP: number
 ): Promise<void> {
   const abort = new AbortController();
   chatAborts.set(chatId, abort);
+  let assistantText = "";
   try {
     const { model, tokenizer } = await library.loadForInference(variantId);
     const ids: number[] = Array.from(tokenizer.encode(prompt));
     for (let n = 0; n < maxTokens; n++) {
       if (abort.signal.aborted) {
+        if (assistantText) datasets.appendChatMessage(sessionId, { role: "assistant", text: assistantText, variantId });
+        broadcastChats();
         broker.broadcast({ ev: "chat_done", chatId, reason: "stopped" });
         return;
       }
       const token = model.nextToken(ids, temperature, topP);
       ids.push(token);
-      broker.broadcast({ ev: "chat_token", chatId, token, text: tokenizer.decode([token]) });
+      const text = tokenizer.decode([token]);
+      assistantText += text;
+      broker.broadcast({ ev: "chat_token", chatId, token, text });
       await new Promise((r) => setImmediate(r)); // stream frames between tokens
     }
+    datasets.appendChatMessage(sessionId, { role: "assistant", text: assistantText, variantId });
+    broadcastChats();
     broker.broadcast({ ev: "chat_done", chatId, reason: "complete" });
   } catch (err) {
     broker.broadcast({
@@ -125,9 +252,14 @@ function handleOp(msg: ClientMessage, send: (msg: ServerMessage) => void): void 
       return;
     case "run":
       if (!engine.running) {
-        engine.run().catch((err) =>
-          broker.broadcast({ ev: "error", message: err instanceof Error ? err.message : String(err) })
-        );
+        engine.run()
+          .then(() => {
+            createRunAcceptance(msg.projectId);
+            broker.broadcast({ ev: "library", variants: library.list() });
+          })
+          .catch((err) =>
+            broker.broadcast({ ev: "error", message: err instanceof Error ? err.message : String(err) })
+          );
       }
       return;
     case "stop":
@@ -140,8 +272,14 @@ function handleOp(msg: ClientMessage, send: (msg: ServerMessage) => void): void 
       return engine.stop(); // abort + wake paused nodes; trainer frees GPU ctx
     case "commit_training":
       return engine.commitEarly(); // freeze weights/moments, node ends 'done'
+    case "accept_model_result":
+      return acceptModelResult(msg.proposalId);
+    case "reject_model_result":
+      return rejectModelResult(msg.proposalId);
     case "update_learning_rate":
       return engine.setLearningRate(msg.lr); // hot lr swap, loop never pauses
+    case "reset_model":
+      return resetTrainerCheckpoint(msg.nodeId);
     case "update_params":
       return engine.updateNodeParams(msg.nodeId, msg.params);
     case "move_node":
@@ -186,11 +324,32 @@ function handleOp(msg: ClientMessage, send: (msg: ServerMessage) => void): void 
     case "library_stop_train":
       return library.stopTraining(msg.variantId);
     case "chat_send":
-      void runChat(msg.chatId, msg.variantId, msg.prompt, msg.maxTokens ?? 96, msg.temperature ?? 0.8, msg.topP ?? 1);
+      if (!datasets.loadChat(msg.sessionId)) {
+        datasets.createChat(msg.sessionId, msg.prompt.trim().slice(0, 48) || "New chat", msg.variantId);
+      }
+      datasets.appendChatMessage(msg.sessionId, { role: "user", text: msg.prompt, variantId: msg.variantId });
+      send({ ev: "chats", sessions: datasets.listChats() });
+      void runChat(msg.chatId, msg.sessionId, msg.variantId, msg.prompt, msg.maxTokens ?? 96, msg.temperature ?? 0.8, msg.topP ?? 1);
       return;
     case "chat_stop":
       chatAborts.get(msg.chatId)?.abort();
       return;
+    case "list_chats":
+      return send({ ev: "chats", sessions: datasets.listChats() });
+    case "create_chat":
+      datasets.createChat(msg.sessionId, msg.title ?? "New chat", msg.variantId ?? null);
+      return send({ ev: "chats", sessions: datasets.listChats() });
+    case "load_chat": {
+      const session = datasets.loadChat(msg.sessionId);
+      if (!session) throw new Error(`No chat session: ${msg.sessionId}`);
+      return send({ ev: "chat_session", session });
+    }
+    case "rename_chat":
+      datasets.renameChat(msg.sessionId, msg.title);
+      return broker.broadcast({ ev: "chats", sessions: datasets.listChats() });
+    case "delete_chat":
+      datasets.deleteChat(msg.sessionId);
+      return broker.broadcast({ ev: "chats", sessions: datasets.listChats() });
     case "mcp":
       void mcp(msg.payload).then((payload) => send({ ev: "mcp_result", payload }));
       return;
@@ -227,6 +386,7 @@ const broker = new MessageBroker({
     projects: () => datasets.listProjects(),
   },
   onUiConnect: (send) => {
+    send({ ev: "runtime", ...runtimeInfo() });
     send({ ev: "catalog", descriptors: listDescriptors() });
     send({ ev: "templates", templates: TEMPLATES });
     send({ ev: "state", state: engine.snapshot() });

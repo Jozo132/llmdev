@@ -85,8 +85,27 @@ function sparkPath(id: string): string {
 
 const latestLoss = computed(() => (id: string) => {
   const arr = store.variantMetrics[id];
-  return arr?.length ? arr[arr.length - 1].loss.toFixed(3) : null;
+  const live = arr?.length ? arr[arr.length - 1].loss : null;
+  const finalLoss = store.library.find((v) => v.id === id)?.finalLoss ?? null;
+  const loss = live ?? finalLoss;
+  return loss != null ? loss.toFixed(3) : null;
 });
+
+function techStack(v: ModelVariant): string[] {
+  const cfg = v.config as unknown as Record<string, unknown>;
+  const loraOn = cfg.fineTuneMode === "lora";
+  const esOn = Boolean(cfg.stochasticExplorationPool);
+  const mlp = String(cfg.mlp ?? "standard");
+  const stack = [
+    store.runtime?.backend ?? "backend ?",
+    String(cfg.mixer ?? "causal-mean"),
+    mlp === "swiglu" ? "SwiGLU" : "MLP",
+    String(cfg.loss ?? "cross-entropy"),
+    loraOn ? "LoRA" : "Full Adam",
+  ];
+  if (esOn) stack.push(loraOn ? "ES population" : "ES temporal");
+  return stack;
+}
 </script>
 
 <template>
@@ -136,10 +155,23 @@ const latestLoss = computed(() => (id: string) => {
           :class="v.source === 'export' ? 'bg-slate-800 text-slate-400' : 'bg-violet-950 text-violet-300'"
         >{{ v.source }}</span>
       </div>
-      <p class="font-mono text-[10px] text-slate-500">
-        {{ (v.paramCount / 1e6).toFixed(2) }}M · {{ v.config.mixer }} · {{ v.config.loss }}
-        <span v-if="v.finalLoss"> · loss {{ v.finalLoss.toFixed(3) }}</span>
-      </p>
+      <div class="mt-1 grid grid-cols-2 gap-1">
+        <div class="rounded border border-slate-800 bg-canvas px-1.5 py-1">
+          <p class="text-[8px] uppercase tracking-widest text-slate-600">size</p>
+          <p class="font-mono text-[11px] text-slate-300">{{ (v.paramCount / 1e6).toFixed(2) }}M</p>
+        </div>
+        <div class="rounded border border-slate-800 bg-canvas px-1.5 py-1">
+          <p class="text-[8px] uppercase tracking-widest text-slate-600">loss</p>
+          <p class="font-mono text-[11px] text-amber-300">{{ latestLoss(v.id) ?? "—" }}</p>
+        </div>
+      </div>
+      <div class="mt-1 flex flex-wrap gap-1">
+        <span
+          v-for="tech in techStack(v)"
+          :key="tech"
+          class="rounded border border-slate-800 bg-slate-950 px-1.5 py-0.5 font-mono text-[9px] text-slate-400"
+        >{{ tech }}</span>
+      </div>
 
       <!-- live cross-benchmark sparkline -->
       <div class="mt-1 flex items-center gap-2">
@@ -157,16 +189,6 @@ const latestLoss = computed(() => (id: string) => {
           class="rounded bg-slate-800 px-2 py-0.5 text-[10px] hover:bg-slate-700"
           @click.stop="openClone(v)"
         >Clone & Modify</button>
-        <button
-          v-if="v.source === 'clone' && !v.training"
-          class="rounded bg-emerald-900 px-2 py-0.5 text-[10px] text-emerald-200 hover:bg-emerald-800"
-          @click.stop="store.trainVariant(v.id)"
-        >▶ Train</button>
-        <button
-          v-if="v.training"
-          class="rounded bg-red-900 px-2 py-0.5 text-[10px] text-red-200 hover:bg-red-800"
-          @click.stop="store.stopVariantTraining(v.id)"
-        >■ Stop</button>
         <button
           v-if="!v.training"
           class="rounded bg-slate-800 px-2 py-0.5 text-[10px] hover:bg-slate-700"

@@ -327,6 +327,7 @@ export class Engine extends EventEmitter {
         this.lrOverride = null;  // lr override is scoped per node run
         try {
           rt.outputs = await rt.node.run(inputs, {
+            nodeId: id,
             artifactsDir: this.artifactsDir,
             signal,
             shouldCommit: () => this.commitFlag,
@@ -376,5 +377,13 @@ export class Engine extends EventEmitter {
 
   private emitState(): void {
     this.emit("state", this.snapshot());
+  }
+
+  outputsByNode(): Record<string, Record<string, unknown>> {
+    const out: Record<string, Record<string, unknown>> = {};
+    for (const [id, rt] of this.nodes) {
+      if (rt.outputs) out[id] = rt.outputs;
+    }
+    return out;
   }
 }

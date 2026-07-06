@@ -36,6 +36,8 @@ export interface ParamSchemaEntry {
   options?: string[];       // for "select"
   default?: unknown;
   description?: string;
+  /** Show only when the selected node params match these literal/regex rules. */
+  visibleWhen?: Record<string, unknown>;
   /** Inline theory: what the parameter does mathematically (gradients, VRAM…). */
   theory?: string;
   /** Strict safe/reasonable operating range shown in the UI. */
@@ -58,6 +60,8 @@ export interface NodeDescriptor {
 export type NodeStatus = "idle" | "running" | "done" | "error" | "skipped";
 
 export interface NodeRunContext {
+  /** Runtime node id, stable across graph saves and reruns. */
+  nodeId: string;
   /** Resolved artifacts directory (respects LLMDEV_ARTIFACTS_DIR). */
   artifactsDir: string;
   /** Emit a metric sample (streamed live to the web UI). */
@@ -171,6 +175,16 @@ export interface ModelConfig {
   loraRank?: number;
   /** LoRA α — adapter contribution is scaled by α/r. */
   loraAlpha?: number;
+  /** Enable stochastic ES mutations alongside the gradient path. */
+  stochasticExplorationPool?: boolean;
+  /** Parallel population size for LoRA; forced to 1 in full-parameter mode. */
+  populationSize?: number;
+  /** Top-N survivor count used by the ES reducer. */
+  survivalCount?: number;
+  /** Survivor percentage used to derive Top-N for LoRA ES. */
+  survivalRate?: number;
+  /** Mutation volatility σ for pseudo-Gaussian perturbations. */
+  stochasticMutationSigma?: number;
 }
 
 export interface TrainedModelHandle {

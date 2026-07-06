@@ -64,6 +64,27 @@ export interface ProjectGraph {
   edges: GraphEdgeRow[];
 }
 
+export interface ChatSessionMeta {
+  id: string;
+  title: string;
+  variantId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ChatStoredMessage {
+  id: number;
+  sessionId: string;
+  role: "user" | "assistant" | "system" | "tool";
+  text: string;
+  variantId: string | null;
+  createdAt: number;
+}
+
+export interface ChatSession extends ChatSessionMeta {
+  messages: ChatStoredMessage[];
+}
+
 export interface ShardWriter {
   /** Append one uint16 token chunk (committed in batched transactions). */
   append(tokens: Uint16Array): void;
@@ -131,6 +152,23 @@ export class DatasetDB {
         target_port     TEXT NOT NULL,
         PRIMARY KEY (project_id, edge_id)
       ) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS chat_sessions (
+        id          TEXT PRIMARY KEY,
+        title       TEXT NOT NULL,
+        variant_id  TEXT,
+        created_at  INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id  TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+        role        TEXT NOT NULL,
+        text        TEXT NOT NULL,
+        variant_id  TEXT,
+        created_at  INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, id);
     `);
     this.db.pragma("foreign_keys = ON");
   }
@@ -334,6 +372,78 @@ export class DatasetDB {
 
   deleteProject(projectId: string): void {
     this.db.prepare(`DELETE FROM projects WHERE id = ?`).run(projectId);
+  }
+
+  // ── Chat history persistence ─────────────────────────────────────────────
+
+  listChats(): ChatSessionMeta[] {
+    return this.db
+      .prepare(
+        `SELECT id, title, variant_id AS variantId,
+                created_at AS createdAt, updated_at AS updatedAt
+           FROM chat_sessions ORDER BY updated_at DESC`
+      )
+      .all() as ChatSessionMeta[];
+  }
+
+  createChat(id: string, title: string, variantId?: string | null): void {
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO chat_sessions (id, title, variant_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET title = excluded.title,
+                                      variant_id = excluded.variant_id,
+                                      updated_at = excluded.updated_at`
+      )
+      .run(id, title || "New chat", variantId ?? null, now, now);
+  }
+
+  loadChat(sessionId: string): ChatSession | null {
+    const session = this.db
+      .prepare(
+        `SELECT id, title, variant_id AS variantId,
+                created_at AS createdAt, updated_at AS updatedAt
+           FROM chat_sessions WHERE id = ?`
+      )
+      .get(sessionId) as ChatSessionMeta | undefined;
+    if (!session) return null;
+    const messages = this.db
+      .prepare(
+        `SELECT id, session_id AS sessionId, role, text, variant_id AS variantId,
+                created_at AS createdAt
+           FROM chat_messages WHERE session_id = ? ORDER BY id`
+      )
+      .all(sessionId) as ChatStoredMessage[];
+    return { ...session, messages };
+  }
+
+  renameChat(sessionId: string, title: string): void {
+    this.db
+      .prepare(`UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?`)
+      .run(title || "New chat", Date.now(), sessionId);
+  }
+
+  deleteChat(sessionId: string): void {
+    this.db.prepare(`DELETE FROM chat_sessions WHERE id = ?`).run(sessionId);
+  }
+
+  appendChatMessage(
+    sessionId: string,
+    message: { role: ChatStoredMessage["role"]; text: string; variantId?: string | null }
+  ): void {
+    const now = Date.now();
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO chat_messages (session_id, role, text, variant_id, created_at)
+           VALUES (?, ?, ?, ?, ?)`
+        )
+        .run(sessionId, message.role, message.text, message.variantId ?? null, now);
+      this.db
+        .prepare(`UPDATE chat_sessions SET updated_at = ? WHERE id = ?`)
+        .run(now, sessionId);
+    })();
   }
 
   close(): void {

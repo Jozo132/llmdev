@@ -2,7 +2,7 @@
 /**
  * TrainingAnalyticsPanel — widescreen historic analytics dashboard.
  *
- * Renders the FULL (non-truncated) metric history as SVG line charts:
+ * Renders the bounded, downsampled metric history as SVG line charts:
  *   · Loss curve            (train loss per step)
  *   · Token throughput      (tokens/sec velocity)
  *   · Memory tracking       (VRAM + RSS, dual series)
@@ -78,7 +78,17 @@ const charts = computed<Chart[]>(() => [
     unit: "loss",
     series: [
       { label: "train loss", color: "#f59e0b", points: store.history.loss ?? [] },
+      { label: "ES best", color: "#ef4444", points: store.history.es_best_loss ?? [] },
       { label: "eval loss", color: "#10b981", points: store.history.eval_loss ?? [] },
+    ],
+  },
+  {
+    title: "Stochastic Exploration",
+    unit: "fitness",
+    series: [
+      { label: "loss delta", color: "#22d3ee", points: store.history.stochastic_loss_delta ?? [] },
+      { label: "population var", color: "#a3e635", points: store.history.population_variance ?? [] },
+      { label: "status", color: "#f97316", points: store.history.es_exploration_status ?? [] },
     ],
   },
   {
@@ -114,12 +124,19 @@ const charts = computed<Chart[]>(() => [
   },
 ]);
 
-/** Shared y-domain across a chart's series; x = sample index (full history). */
+/** Shared y-domain across a chart's bounded series; x = retained sample index. */
 function chartScale(c: Chart) {
-  const all = c.series.flatMap((s) => s.points.map((p) => p.value)).filter((v) => Number.isFinite(v));
   const maxLen = Math.max(1, ...c.series.map((s) => s.points.length));
-  let lo = all.length ? Math.min(...all) : 0;
-  let hi = all.length ? Math.max(...all) : 1;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const s of c.series) {
+    for (const p of s.points) {
+      if (!Number.isFinite(p.value)) continue;
+      if (p.value < lo) lo = p.value;
+      if (p.value > hi) hi = p.value;
+    }
+  }
+  if (lo === Infinity || hi === -Infinity) { lo = 0; hi = 1; }
   if (hi - lo < 1e-9) { hi = lo + 1; lo = lo - (lo === 0 ? 0 : 1e-9); }
   const span = hi - lo;
   lo -= span * 0.05;
@@ -161,10 +178,13 @@ const latest = (name: string): number | null => {
 const stats = computed(() => {
   const loss = store.history.loss ?? [];
   const tps = store.history.tokens_per_sec ?? [];
+  const esDelta = latest("stochastic_loss_delta");
   return {
     samples: loss.length,
     lastLoss: latest("loss"),
     minLoss: loss.length ? Math.min(...loss.map((p) => p.value)) : null,
+    esBest: latest("es_best_loss"),
+    esDelta,
     avgTps: tps.length ? tps.reduce((s, p) => s + p.value, 0) / tps.length : null,
     peakVram: (store.history.vram_mb ?? []).reduce((m, p) => Math.max(m, p.value), 0),
   };
@@ -179,7 +199,7 @@ const stats = computed(() => {
         Training analytics
       </h2>
       <span class="font-mono text-[11px] text-slate-500">
-        {{ stats.samples }} samples (full history, non-truncated)
+        {{ stats.samples }} retained samples (bounded)
       </span>
 
       <div class="ml-auto flex items-center gap-2">
@@ -226,7 +246,7 @@ const stats = computed(() => {
     </div>
 
     <!-- ── Summary strip ─────────────────────────────────────────────────── -->
-    <div class="mb-4 grid grid-cols-2 gap-2 md:grid-cols-4">
+    <div class="mb-4 grid grid-cols-2 gap-2 md:grid-cols-6">
       <div class="rounded border border-slate-800 bg-panel p-2">
         <p class="text-[10px] uppercase tracking-widest text-slate-500">Last loss</p>
         <p class="font-mono text-lg text-amber-300">{{ stats.lastLoss?.toFixed(4) ?? "—" }}</p>
@@ -234,6 +254,16 @@ const stats = computed(() => {
       <div class="rounded border border-slate-800 bg-panel p-2">
         <p class="text-[10px] uppercase tracking-widest text-slate-500">Best loss</p>
         <p class="font-mono text-lg text-emerald-300">{{ stats.minLoss?.toFixed(4) ?? "—" }}</p>
+      </div>
+      <div class="rounded border border-slate-800 bg-panel p-2">
+        <p class="text-[10px] uppercase tracking-widest text-slate-500">ES best</p>
+        <p class="font-mono text-lg text-red-300">{{ stats.esBest?.toFixed(4) ?? "—" }}</p>
+      </div>
+      <div class="rounded border border-slate-800 bg-panel p-2">
+        <p class="text-[10px] uppercase tracking-widest text-slate-500">ES delta</p>
+        <p class="font-mono text-lg" :class="(stats.esDelta ?? 0) <= 0 ? 'text-cyan-300' : 'text-orange-300'">
+          {{ stats.esDelta != null ? stats.esDelta.toFixed(4) : "—" }}
+        </p>
       </div>
       <div class="rounded border border-slate-800 bg-panel p-2">
         <p class="text-[10px] uppercase tracking-widest text-slate-500">Avg throughput</p>
@@ -245,7 +275,7 @@ const stats = computed(() => {
       </div>
     </div>
 
-    <!-- ── Full-history charts ───────────────────────────────────────────── -->
+    <!-- ── Bounded charts ────────────────────────────────────────────────── -->
     <div v-for="c in charts" :key="c.title" class="mb-4 rounded-lg border border-slate-800 bg-panel p-3">
       <div class="mb-1 flex items-center gap-3">
         <h3 class="text-xs font-bold uppercase tracking-widest text-slate-400">{{ c.title }}</h3>

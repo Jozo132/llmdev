@@ -144,6 +144,98 @@ __global__ void k_sgemm_acc(const float* __restrict__ A, const float* __restrict
   if (row < M && col < N) C[row * (long)N + col] += alpha * acc;
 }
 
+// ── GPU-native stochastic exploration for LoRA adapter pools ───────────────
+// Stateless PCG-style hash: no host RNG state, no random buffers crossing PCIe.
+__device__ __forceinline__ unsigned int pcg_hash(unsigned int input) {
+  unsigned int state = input * 747796405u + 2891336453u;
+  unsigned int word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+
+__device__ __forceinline__ float u01(unsigned int seed) {
+  return ((pcg_hash(seed) >> 8) + 1.0f) * 0x1.0p-24f;
+}
+
+__device__ __forceinline__ float pseudo_gaussian(unsigned int seed) {
+  const float u1 = fmaxf(u01(seed), 1e-7f);
+  const float u2 = u01(seed ^ 0x9e3779b9u);
+  return sqrtf(-2.0f * logf(u1)) * cosf(6.28318530718f * u2);
+}
+
+__global__ void k_stochastic_mutate(const float* __restrict__ base,
+                                    float* __restrict__ population,
+                                    int paramCount, int populationSize,
+                                    unsigned int iterationStep, float sigma) {
+  long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  long total = (long)paramCount * populationSize;
+  for (; idx < total; idx += (long)gridDim.x * blockDim.x) {
+    const int candidate = (int)(idx / paramCount);
+    const int weightIdx = (int)(idx % paramCount);
+    const unsigned int seed = pcg_hash((unsigned int)weightIdx + iterationStep * 1337u +
+                                       (unsigned int)candidate * 0x85ebca6bu);
+    population[idx] = base[weightIdx] + sigma * pseudo_gaussian(seed);
+  }
+}
+
+__global__ void k_reduce_fittest(const float* __restrict__ losses,
+                                 int* __restrict__ order,
+                                 int populationSize) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  for (int i = 0; i < populationSize; i++) order[i] = i;
+  for (int i = 0; i < populationSize - 1; i++) {
+    int best = i;
+    for (int j = i + 1; j < populationSize; j++) {
+      if (losses[order[j]] < losses[order[best]]) best = j;
+    }
+    int tmp = order[i];
+    order[i] = order[best];
+    order[best] = tmp;
+  }
+}
+
+__global__ void k_gather_survivors(const float* __restrict__ population,
+                                   const int* __restrict__ order,
+                                   float* __restrict__ survivors,
+                                   int paramCount, int survivorCount) {
+  long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  long total = (long)paramCount * survivorCount;
+  for (; idx < total; idx += (long)gridDim.x * blockDim.x) {
+    const int s = (int)(idx / paramCount);
+    const int w = (int)(idx % paramCount);
+    survivors[idx] = population[(long)order[s] * paramCount + w];
+  }
+}
+
+__global__ void k_replenish_population(float* __restrict__ population,
+                                       const float* __restrict__ survivors,
+                                       int paramCount, int populationSize,
+                                       int survivorCount, unsigned int iterationStep,
+                                       float sigma) {
+  long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  long total = (long)paramCount * populationSize;
+  for (; idx < total; idx += (long)gridDim.x * blockDim.x) {
+    const int candidate = (int)(idx / paramCount);
+    const int weightIdx = (int)(idx % paramCount);
+    const int survivor = candidate % survivorCount;
+    float value = survivors[(long)survivor * paramCount + weightIdx];
+    if (candidate >= survivorCount) {
+      const unsigned int seed = pcg_hash((unsigned int)weightIdx + iterationStep * 7331u +
+                                         (unsigned int)candidate * 0xc2b2ae35u);
+      value += sigma * 0.35f * pseudo_gaussian(seed);
+    }
+    population[idx] = value;
+  }
+}
+
+__global__ void k_blend_best(float* __restrict__ base,
+                             const float* __restrict__ best,
+                             int paramCount, float blend) {
+  long idx = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  for (; idx < paramCount; idx += (long)gridDim.x * blockDim.x) {
+    base[idx] = base[idx] * (1.0f - blend) + best[idx] * blend;
+  }
+}
+
 // ── Flash-style attention: last-query row, tiled KV slicing ───────────────
 // Computes out = softmax(q·K^T/√d)·V for q = x[T-1], K = V = x, WITHOUT ever
 // materializing the T×T score matrix: keys stream through a shared-memory
@@ -438,6 +530,102 @@ int llm_sgemm_acc(const float* A, const float* B, float* C, int M, int K, int N,
   cudaFree(dA);
   cudaFree(dB);
   cudaFree(dC);
+  return ok;
+}
+
+int llm_es_mutate_population(const float* base, float* population, int paramCount,
+                             int populationSize, int iterationStep, float sigma) {
+  if (paramCount <= 0 || populationSize <= 0) return 0;
+  float *dBase, *dPop;
+  const size_t baseBytes = (size_t)paramCount * sizeof(float);
+  const size_t popBytes = (size_t)paramCount * populationSize * sizeof(float);
+  CUDA_CHECK(cudaMalloc(&dBase, baseBytes));
+  CUDA_CHECK(cudaMalloc(&dPop, popBytes));
+  CUDA_CHECK(cudaMemcpy(dBase, base, baseBytes, cudaMemcpyHostToDevice));
+  int blocks = (int)(((long)paramCount * populationSize + 255) / 256);
+  if (blocks > 65535) blocks = 65535;
+  k_stochastic_mutate<<<blocks, 256>>>(dBase, dPop, paramCount, populationSize,
+                                       (unsigned int)iterationStep, sigma);
+  cudaError_t launchErr = cudaGetLastError();
+  int ok = 1;
+  if (launchErr != cudaSuccess) {
+    fprintf(stderr, "CUDA kernel launch error %s at %s:%d\n",
+            cudaGetErrorString(launchErr), __FILE__, __LINE__);
+    ok = 0;
+  } else {
+    CUDA_CHECK(cudaMemcpy(population, dPop, popBytes, cudaMemcpyDeviceToHost));
+  }
+  cudaFree(dBase);
+  cudaFree(dPop);
+  return ok;
+}
+
+int llm_ctx_reduce_fittest(float* base, float* population, const float* losses,
+                           int paramCount, int populationSize, int survivorCount,
+                           int iterationStep, float blend, float sigma,
+                           float* metrics) {
+  if (paramCount <= 0 || populationSize <= 0) return 0;
+  survivorCount = max(1, min(survivorCount, populationSize));
+  blend = fmaxf(0.0f, fminf(blend, 1.0f));
+  float *dBase, *dPop, *dLoss, *dSurvivors;
+  int* dOrder;
+  const size_t baseBytes = (size_t)paramCount * sizeof(float);
+  const size_t popBytes = (size_t)paramCount * populationSize * sizeof(float);
+  const size_t lossBytes = (size_t)populationSize * sizeof(float);
+  const size_t survivorBytes = (size_t)paramCount * survivorCount * sizeof(float);
+  CUDA_CHECK(cudaMalloc(&dBase, baseBytes));
+  CUDA_CHECK(cudaMalloc(&dPop, popBytes));
+  CUDA_CHECK(cudaMalloc(&dLoss, lossBytes));
+  CUDA_CHECK(cudaMalloc(&dOrder, (size_t)populationSize * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&dSurvivors, survivorBytes));
+  CUDA_CHECK(cudaMemcpy(dBase, base, baseBytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dPop, population, popBytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dLoss, losses, lossBytes, cudaMemcpyHostToDevice));
+  k_reduce_fittest<<<1, 1>>>(dLoss, dOrder, populationSize);
+  CUDA_CHECK_LAUNCH();
+  int blocksSurvivors = (int)(((long)paramCount * survivorCount + 255) / 256);
+  if (blocksSurvivors > 65535) blocksSurvivors = 65535;
+  k_gather_survivors<<<blocksSurvivors, 256>>>(dPop, dOrder, dSurvivors,
+                                               paramCount, survivorCount);
+  CUDA_CHECK_LAUNCH();
+  int blocksPop = (int)(((long)paramCount * populationSize + 255) / 256);
+  if (blocksPop > 65535) blocksPop = 65535;
+  k_replenish_population<<<blocksPop, 256>>>(dPop, dSurvivors, paramCount,
+                                             populationSize, survivorCount,
+                                             (unsigned int)iterationStep, sigma);
+  CUDA_CHECK_LAUNCH();
+  int blocksBase = (int)((paramCount + 255) / 256);
+  if (blocksBase > 65535) blocksBase = 65535;
+  k_blend_best<<<blocksBase, 256>>>(dBase, dSurvivors, paramCount, blend);
+  cudaError_t launchErr = cudaGetLastError();
+  int ok = 1;
+  if (launchErr != cudaSuccess) {
+    fprintf(stderr, "CUDA kernel launch error %s at %s:%d\n",
+            cudaGetErrorString(launchErr), __FILE__, __LINE__);
+    ok = 0;
+  } else {
+    int* order = new int[populationSize];
+    CUDA_CHECK(cudaMemcpy(order, dOrder, (size_t)populationSize * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(base, dBase, baseBytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(population, dPop, popBytes, cudaMemcpyDeviceToHost));
+    float mean = 0.0f;
+    for (int i = 0; i < populationSize; i++) mean += losses[i];
+    mean /= populationSize;
+    float variance = 0.0f;
+    for (int i = 0; i < populationSize; i++) {
+      const float delta = losses[i] - mean;
+      variance += delta * delta;
+    }
+    metrics[0] = losses[order[0]];
+    metrics[1] = variance / populationSize;
+    metrics[2] = (float)order[0];
+    delete[] order;
+  }
+  cudaFree(dBase);
+  cudaFree(dPop);
+  cudaFree(dLoss);
+  cudaFree(dOrder);
+  cudaFree(dSurvivors);
   return ok;
 }
 

@@ -7,19 +7,57 @@ import type { MetricEvent, NodeDescriptor, NodeInstanceSpec, EdgeSpec, PipelineS
 import type { ModelVariant, VariantMetric } from "../core/LibraryManager.js";
 import type { ArchTemplate } from "../core/templates.js";
 
+export interface ModelAcceptanceProposal {
+  id: string;
+  projectId: string;
+  modelName: string;
+  oldTrainLoss: number | null;
+  newTrainLoss: number | null;
+  trainLossDelta: number | null;
+  oldDatasetLoss: number | null;
+  newDatasetLoss: number | null;
+  datasetLossDelta: number | null;
+  oldTechStack: string[];
+  newTechStack: string[];
+}
+
+export interface ChatSessionMeta {
+  id: string;
+  title: string;
+  variantId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ChatStoredMessage {
+  id: number;
+  sessionId: string;
+  role: "user" | "assistant" | "system" | "tool";
+  text: string;
+  variantId: string | null;
+  createdAt: number;
+}
+
+export interface ChatSession extends ChatSessionMeta {
+  messages: ChatStoredMessage[];
+}
+
 // Client → Server
 export type ClientMessage =
   | { op: "get_state" }
   | { op: "get_catalog" }                                     // node palette
   | { op: "load_pipeline"; spec: PipelineSpec }
-  | { op: "run" }
+  | { op: "run"; projectId?: string }
   | { op: "stop" }
   // ── runtime execution control ──
   | { op: "pause_training" }   // suspend between steps, keep optimizer state hot
   | { op: "resume_training" }
   | { op: "cancel_training" }  // abort + release GPU context / host buffers
   | { op: "commit_training" }  // "Commit & Proceed": freeze weights, finish node as done
+  | { op: "accept_model_result"; proposalId: string }
+  | { op: "reject_model_result"; proposalId: string }
   | { op: "update_learning_rate"; lr: number } // hot-tune Adam lr mid-run, no pause/reset
+  | { op: "reset_model"; nodeId: string } // delete trainer checkpoint; next run starts fresh
   | { op: "update_params"; nodeId: string; params: Record<string, unknown> }
   | { op: "move_node"; nodeId: string; position: { x: number; y: number } }
   // ── interactive graph editing ──
@@ -39,8 +77,13 @@ export type ClientMessage =
   | { op: "library_train"; variantId: string; steps?: number; batchSize?: number; lr?: number }
   | { op: "library_stop_train"; variantId: string }
   // ── chat sandbox (token-by-token local inference) ──
-  | { op: "chat_send"; chatId: string; variantId: string; prompt: string; maxTokens?: number; temperature?: number; topP?: number }
+  | { op: "chat_send"; chatId: string; sessionId: string; variantId: string; prompt: string; maxTokens?: number; temperature?: number; topP?: number }
   | { op: "chat_stop"; chatId: string }
+  | { op: "list_chats" }
+  | { op: "create_chat"; sessionId: string; title?: string; variantId?: string | null }
+  | { op: "load_chat"; sessionId: string }
+  | { op: "rename_chat"; sessionId: string; title: string }
+  | { op: "delete_chat"; sessionId: string }
   // ── MCP: JSON-RPC 2.0 envelope (initialize / tools/list / tools/call) ──
   | { op: "mcp"; payload: unknown }
   // ── project / visual-graph persistence (SQLite warehouse) ──
@@ -53,15 +96,19 @@ export type ClientMessage =
 // Server → Client
 export type ServerMessage =
   | { ev: "state"; state: PipelineStateSnapshot }
+  | { ev: "runtime"; backend: string; deviceName?: string | null }
   | { ev: "catalog"; descriptors: NodeDescriptor[] }
   | { ev: "templates"; templates: ArchTemplate[] }
   | { ev: "metric"; metric: MetricEvent }
   | { ev: "log"; nodeId: string; message: string }
   | { ev: "error"; message: string }
   | { ev: "library"; variants: ModelVariant[] }
+  | { ev: "model_acceptance_required"; proposal: ModelAcceptanceProposal }
   | { ev: "variant_metric"; metric: VariantMetric }
   | { ev: "chat_token"; chatId: string; token: number; text: string }
   | { ev: "chat_done"; chatId: string; reason: "complete" | "stopped" | "error"; message?: string }
+  | { ev: "chats"; sessions: ChatSessionMeta[] }
+  | { ev: "chat_session"; session: ChatSession }
   | { ev: "mcp_result"; payload: unknown }
   | { ev: "projects"; projects: Array<{ id: string; name: string; updatedAt: number }> }
   // ── horizontal scaling: remote compute workers ──

@@ -95,15 +95,45 @@ const DESCRIPTOR: NodeDescriptor = {
         "to ZERO because the frozen base never changes on-device.",
       range: "LoRA for fine-tuning a warm-started checkpoint" },
     { key: "loraRank", label: "LoRA Rank (r)", type: "number", default: 8,
+      visibleWhen: { fineTuneMode: "LoRA (Low-Rank Adaptation)" },
       theory: "Adapter bottleneck width. Trainable params scale linearly with " +
         "r; expressiveness saturates quickly — r=8–16 matches full fine-tune " +
         "quality on most adaptation tasks (LoRA paper, Tab. 6).",
       range: "4–64" },
     { key: "loraAlpha", label: "LoRA Alpha (α)", type: "number", default: 16,
+      visibleWhen: { fineTuneMode: "LoRA (Low-Rank Adaptation)" },
       theory: "Adapter output scale α/r. Keeping α fixed while sweeping r " +
         "keeps the effective adapter learning rate constant; α = 2r is the " +
         "common heuristic.",
       range: "8–64 (typically 2× rank)" },
+    { key: "stochasticExplorationPool", label: "Stochastic Exploration Pool", type: "boolean", default: false,
+      theory: "Runs an ES mutation path beside Adam. LoRA mode keeps P adapter " +
+        "candidates in the population pool; full-parameter mode forces P=1 " +
+        "and uses a single checkpoint snapshot to avoid OOM.",
+      range: "off by default · enable for exploration runs" },
+    { key: "populationSize", label: "Population Size (P)", type: "number", default: 4,
+      visibleWhen: { fineTuneMode: "LoRA (Low-Rank Adaptation)", stochasticExplorationPool: true },
+      theory: "Number of parallel ES candidates. Applied only to LoRA adapter " +
+        "matrices; full-parameter training is clamped to P=1 to avoid " +
+        "duplicating the whole model in VRAM.",
+      range: "LoRA: 2–8 · Full: forced to 1" },
+    { key: "survivalCount", label: "Survival Count (N)", type: "number", default: 1,
+      visibleWhen: { fineTuneMode: "__hidden__" },
+      theory: "Top-N lowest-loss candidates survive the CUDA reducer. " +
+        "Survivors are cloned back into the population and the best survivor " +
+        "is blended into the active adapter line.",
+      range: "1–P" },
+    { key: "survivalRate", label: "Survivor Rate (%)", type: "number", default: 25,
+      visibleWhen: { fineTuneMode: "LoRA (Low-Rank Adaptation)", stochasticExplorationPool: true },
+      theory: "Percentage of the LoRA ES population that survives each reduction. " +
+        "The runtime derives N = ceil(P·rate/100), clamps it to 1–P, clones " +
+        "those survivors, then blends the best survivor into the active adapter line.",
+      range: "1–100" },
+    { key: "stochasticMutationSigma", label: "Stochastic Mutation Volatility (sigma)", type: "number", default: 0.002,
+      visibleWhen: { stochasticExplorationPool: true },
+      theory: "Standard deviation of the stateless pseudo-Gaussian mutation. " +
+        "Higher sigma explores faster but can destabilize candidate fitness.",
+      range: "1e-4 – 1e-2" },
   ],
 };
 
@@ -126,8 +156,18 @@ export class ModelArchitectureNode implements PipelineNode {
       nLayers: number; nHeads: number; kvHeads: number;
       mlp: "standard" | "swiglu"; mixer: string; loss: string;
       fineTuneMode: string; loraRank: number; loraAlpha: number;
+      stochasticExplorationPool: boolean; populationSize: number;
+      survivalCount: number; survivalRate: number; stochasticMutationSigma: number;
     };
     const loraOn = /lora/i.test(String(p.fineTuneMode ?? ""));
+    const stochasticOn = !!p.stochasticExplorationPool;
+    const populationSize = stochasticOn && loraOn ? Math.max(1, Math.round(p.populationSize ?? 4)) : 1;
+    const survivalRate = stochasticOn && loraOn
+      ? Math.min(100, Math.max(1, Number(p.survivalRate ?? 25)))
+      : 100;
+    const survivalCount = stochasticOn && loraOn
+      ? Math.max(1, Math.min(populationSize, Math.ceil(populationSize * survivalRate / 100)))
+      : 1;
     const config: ModelConfig = {
       vocabSize: tokens.vocabSize,
       dModel: p.dModel,
@@ -141,6 +181,11 @@ export class ModelArchitectureNode implements PipelineNode {
       mlp: p.mlp,
       fineTuneMode: loraOn ? "lora" : "full",
       ...(loraOn ? { loraRank: p.loraRank, loraAlpha: p.loraAlpha } : {}),
+      stochasticExplorationPool: stochasticOn,
+      populationSize,
+      survivalCount,
+      survivalRate,
+      stochasticMutationSigma: stochasticOn ? Math.max(0, Number(p.stochasticMutationSigma ?? 0.002)) : 0,
     };
 
     // Design-formula parameter count (matches the live canvas calculator).
@@ -155,6 +200,10 @@ export class ModelArchitectureNode implements PipelineNode {
     if (loraOn) {
       ctx.log(`Fine-tuning mode: LoRA r=${p.loraRank}, α=${p.loraAlpha} — base frozen, ` +
               `adapters on attn q/v (${4 * (p.nLayers ?? 1) * p.dModel * p.loraRank} trainable params)`);
+    }
+    if (config.stochasticExplorationPool) {
+      ctx.log(`Stochastic ES: ${loraOn ? `LoRA population P=${config.populationSize}` : "full-parameter temporal P=1"}, ` +
+              `N=${config.survivalCount}, sigma=${config.stochasticMutationSigma}`);
     }
     ctx.log(`Design total: ${fmtParams(breakdown.total)} params (${p.mixer}, L=${p.nLayers}, h=${p.nHeads}/kv=${p.kvHeads})`);
     return { config, tokens };
